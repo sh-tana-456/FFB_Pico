@@ -56,15 +56,15 @@
 #define MCP3204_SPI       spi1
 
 #define MCP3204_SPI_HZ    1200000
+#define MCP3204_NUM_CHANNELS     2
+#define MCP3204_BYTES_PER_SAMPLE 3
 static int mcp3204_dma_tx_channel = -1;
 static int mcp3204_dma_rx_channel = -1;
-static uint8_t mcp3204_dma_tx_buffer[3];
-static uint8_t mcp3204_dma_rx_buffer[3];
+static uint8_t mcp3204_dma_tx_buffer[MCP3204_BYTES_PER_SAMPLE];
+static uint8_t mcp3204_dma_rx_buffer[MCP3204_BYTES_PER_SAMPLE];
 static volatile bool mcp3204_dma_busy = false;
 static volatile bool mcp3204_sample_ready = false;
-static volatile uint16_t mcp3204_latest_raw[4] = {
-    0, 0, 0, 0
-};
+static volatile uint16_t mcp3204_latest_raw[2] = {0, 0};
 static volatile uint8_t mcp3204_active_channel = 0;
 static volatile uint32_t mcp3204_dma_overrun_count = 0;
 
@@ -149,6 +149,9 @@ typedef struct {
 static debug_metrics_t dbg = {0};
 /*---------------------------------------------*/
 
+static void mcp3204_start_channel(uint8_t channel);
+static void mcp3204_prepare_command(uint8_t channel);
+
 int apply_limit(int value, int max)
 {
     if (value < 0)
@@ -164,30 +167,25 @@ int apply_limit(int value, int max)
 // DMA RX完了割り込みハンドラ
 static void mcp3204_dma_irq_handler(void)
 {
-    uint32_t mask = 1u << mcp3204_dma_rx_channel;
+    dma_hw->ints0 = 1u << mcp3204_dma_rx_channel;
 
-    if ((dma_hw->ints0 & mask) == 0) {
-        return;
-    }
-
-    /*
-     * Write-one-to-clear.
-     */
-    dma_hw->ints0 = mask;
-
-    /*
-     * RX DMAが3バイトを取得した時点で、最後のSPI受信も完了している。
-     */
     gpio_put(MCP3204_PIN_CS, 1);
 
     uint16_t raw =
-        ((uint16_t)(mcp3204_dma_rx_buffer[1] & 0x0f) << 8) |
+        ((mcp3204_dma_rx_buffer[1] & 0x0F) << 8) |
         mcp3204_dma_rx_buffer[2];
 
     mcp3204_latest_raw[mcp3204_active_channel] = raw;
 
-    mcp3204_sample_ready = true;
-    mcp3204_dma_busy = false;
+    if (mcp3204_active_channel < MCP3204_NUM_CHANNELS - 1)
+    {
+        mcp3204_start_channel(mcp3204_active_channel + 1);
+    }
+    else
+    {
+        mcp3204_dma_busy = false;
+        mcp3204_sample_ready = true;
+    }
 }
 
 static void mcp3204_dma_init(void)
@@ -245,38 +243,66 @@ static void mcp3204_dma_init(void)
     mcp3204_sample_ready = false;
 }
 
-static inline bool mcp3204_start_read_dma(uint8_t channel)
+void mcp3204_start_read_dma(void)
 {
-    if (channel > 3) {return false;}
-    if (mcp3204_dma_busy) {mcp3204_dma_overrun_count++; return false;}
+    if (mcp3204_dma_busy)
+        return;
 
     mcp3204_dma_busy = true;
     mcp3204_sample_ready = false;
+
+    mcp3204_start_channel(0);
+}
+
+static void mcp3204_start_channel(uint8_t channel)
+{
     mcp3204_active_channel = channel;
 
-    // MCP3204 single-ended command.
-    mcp3204_dma_tx_buffer[0] = 0x06;
-    mcp3204_dma_tx_buffer[1] = (uint8_t)(channel << 6);
-    mcp3204_dma_tx_buffer[2] = 0x00;
+    mcp3204_prepare_command(channel);
 
-    mcp3204_dma_rx_buffer[0] = 0;
-    mcp3204_dma_rx_buffer[1] = 0;
-    mcp3204_dma_rx_buffer[2] = 0;
-
-    // 再転送用のアドレスと転送数を設定する。
-    dma_channel_set_read_addr(mcp3204_dma_tx_channel, mcp3204_dma_tx_buffer, false);
-    dma_channel_set_trans_count(mcp3204_dma_tx_channel, 3, false);
-    dma_channel_set_write_addr(mcp3204_dma_rx_channel, mcp3204_dma_rx_buffer, false);
-    dma_channel_set_trans_count(mcp3204_dma_rx_channel, 3, false);
-    /*
-     * CSを下げてからRX、TX DMAを同時開始。
-     *
-     * RXを先に待機させておくことで、最初の受信データを
-     * 取りこぼしにくくする。
-     */
     gpio_put(MCP3204_PIN_CS, 0);
-    dma_start_channel_mask((1u << mcp3204_dma_rx_channel) | (1u << mcp3204_dma_tx_channel));
-    return true;
+
+    dma_channel_set_read_addr(
+        mcp3204_dma_rx_channel,
+        &spi_get_hw(MCP3204_SPI)->dr,
+        false
+    );
+
+    dma_channel_set_write_addr(
+        mcp3204_dma_rx_channel,
+        mcp3204_dma_rx_buffer,
+        false
+    );
+
+    dma_channel_set_trans_count(
+        mcp3204_dma_rx_channel,
+        MCP3204_BYTES_PER_SAMPLE,
+        false
+    );
+
+    dma_channel_set_read_addr(
+        mcp3204_dma_tx_channel,
+        mcp3204_dma_tx_buffer,
+        false
+    );
+
+    dma_channel_set_trans_count(
+        mcp3204_dma_tx_channel,
+        MCP3204_BYTES_PER_SAMPLE,
+        false
+    );
+
+    dma_start_channel_mask(
+        (1u << mcp3204_dma_rx_channel) |
+        (1u << mcp3204_dma_tx_channel)
+    );
+}
+
+static void mcp3204_prepare_command(uint8_t channel)
+{
+    mcp3204_dma_tx_buffer[0] = 0x06;
+    mcp3204_dma_tx_buffer[1] = channel << 6;
+    mcp3204_dma_tx_buffer[2] = 0x00;
 }
 
 // wrap IRQ ハンドラ（例としてU相のラップIRQを使い、3相同時更新）
@@ -322,7 +348,7 @@ void pwm_wrap_irq_handler()
     pwm_set_chan_level(slice_v, !chan_v, apply_limit(dv + deadtime / 2, wrap_val));
     pwm_set_chan_level(slice_w, !chan_w, apply_limit(dw + deadtime / 2, wrap_val));
     // 次割り込み用のADC読み込み開始
-    (void)mcp3204_start_read_dma(0);
+    (void)mcp3204_start_read_dma();
 }
 
 void pwm_init_set()
@@ -593,7 +619,7 @@ void tud_cdc_rx_cb(uint8_t itf)
 void core1_main()
 {
     mcp3204_dma_init();
-    mcp3204_start_read_dma(0);
+    mcp3204_start_read_dma();
 
     gpio_init(PIN_U_SD);
     gpio_init(PIN_V_SD);
