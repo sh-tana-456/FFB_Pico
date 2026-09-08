@@ -54,6 +54,7 @@
 #define UART_BAUD_1 2500000
 // SPI設定
 #define MCP3204_SPI       spi1
+#define CURRENT_MA_PER_COUNT (3.3f / 4095.f) / (0.044f / 1.0f) * 1000.0f
 
 #define MCP3204_SPI_HZ    1200000
 #define MCP3204_NUM_CHANNELS     2
@@ -120,33 +121,6 @@ static volatile int32_t current_offset_raw = 2048;
 static int32_t current_ma_per_count_q16;
 /*---------------------------------------------*/
 
-/*-----------------DEBUG METRICS---------------*/
-typedef struct {
-    volatile uint32_t hid_set_report_count;
-    volatile uint32_t hid_get_report_count;
-    volatile uint32_t hid_last_report_id;
-
-    volatile uint32_t hid_last_us;
-    volatile uint32_t hid_interval_us;
-    volatile uint32_t hid_interval_max_us;
-
-    volatile uint32_t torque_update_count;
-    volatile uint32_t torque_last_us;
-    volatile uint32_t torque_latency_us;
-    volatile uint32_t torque_latency_max_us;
-
-    volatile uint32_t pwm_irq_count;
-    volatile uint32_t pwm_irq_last_us;
-    volatile uint32_t pwm_irq_interval_us;
-    volatile uint32_t pwm_irq_interval_max_us;
-
-    volatile uint32_t cdc_write_count;
-    volatile uint32_t cdc_drop_count;
-
-    volatile uint32_t ffb_command_sequence;
-    volatile uint32_t ffb_applied_sequence;
-} debug_metrics_t;
-static debug_metrics_t dbg = {0};
 /*---------------------------------------------*/
 
 static void mcp3204_start_channel(uint8_t channel);
@@ -262,40 +236,12 @@ static void mcp3204_start_channel(uint8_t channel)
 
     gpio_put(MCP3204_PIN_CS, 0);
 
-    dma_channel_set_read_addr(
-        mcp3204_dma_rx_channel,
-        &spi_get_hw(MCP3204_SPI)->dr,
-        false
-    );
-
-    dma_channel_set_write_addr(
-        mcp3204_dma_rx_channel,
-        mcp3204_dma_rx_buffer,
-        false
-    );
-
-    dma_channel_set_trans_count(
-        mcp3204_dma_rx_channel,
-        MCP3204_BYTES_PER_SAMPLE,
-        false
-    );
-
-    dma_channel_set_read_addr(
-        mcp3204_dma_tx_channel,
-        mcp3204_dma_tx_buffer,
-        false
-    );
-
-    dma_channel_set_trans_count(
-        mcp3204_dma_tx_channel,
-        MCP3204_BYTES_PER_SAMPLE,
-        false
-    );
-
-    dma_start_channel_mask(
-        (1u << mcp3204_dma_rx_channel) |
-        (1u << mcp3204_dma_tx_channel)
-    );
+    dma_channel_set_read_addr(mcp3204_dma_rx_channel, &spi_get_hw(MCP3204_SPI)->dr, false);
+    dma_channel_set_write_addr(mcp3204_dma_rx_channel, mcp3204_dma_rx_buffer, false);
+    dma_channel_set_trans_count(mcp3204_dma_rx_channel, MCP3204_BYTES_PER_SAMPLE, false);
+    dma_channel_set_read_addr(mcp3204_dma_tx_channel, mcp3204_dma_tx_buffer, false);
+    dma_channel_set_trans_count(mcp3204_dma_tx_channel, MCP3204_BYTES_PER_SAMPLE, false);
+    dma_start_channel_mask((1u << mcp3204_dma_rx_channel) | (1u << mcp3204_dma_tx_channel));
 }
 
 static void mcp3204_prepare_command(uint8_t channel)
@@ -310,7 +256,9 @@ void pwm_wrap_irq_handler()
 {
     // IRQ フラグクリア（U相スライス）
     pwm_clear_irq(slice_u);
-    uint16_t current_raw = mcp3204_latest_raw[0];
+    
+    int32_t iu_ma = (int32_t)((float)mcp3204_latest_raw[0] * CURRENT_MA_PER_COUNT);
+    int32_t iv_ma = (int32_t)((float)mcp3204_latest_raw[1] * CURRENT_MA_PER_COUNT);
 
     // 位相更新
     phase = phase & (PHASE_MAX - 1);
