@@ -90,6 +90,8 @@ volatile int8_t limitRot_core0 = 0;
 
 uint16_t adc0 = 0;
 uint16_t apps_y = 0;
+int16_t I_d_global = 0;
+int16_t I_q_global = 0;
 
 /*-------------only use in CORE1-------------*/
 // 位相変数（rad単位）、3相分はオフセットで扱う
@@ -105,6 +107,7 @@ uint chan_u, chan_v, chan_w;
 float MR = 0.0f; // 変調率
 float torque_max = 0.10f;
 float sinValues[2 * PHASE_RSL];
+float cosValues[2 * PHASE_RSL];
 float rdmValues[2 * PHASE_RSL];
 int rotate_mode = 1;
 uint8_t enc_rx_buffer[12];
@@ -118,7 +121,6 @@ const uint32_t angle_offset = 7420; // 生のエンコーダーの0点と物理�
 volatile int32_t elec_angle = 0;
 
 static volatile int32_t current_offset_raw = 2048;
-static int32_t current_ma_per_count_q16;
 /*---------------------------------------------*/
 
 /*---------------------------------------------*/
@@ -257,9 +259,14 @@ void pwm_wrap_irq_handler()
     // IRQ フラグクリア（U相スライス）
     pwm_clear_irq(slice_u);
     
-    int32_t iu_ma = (int32_t)((float)mcp3204_latest_raw[0] * CURRENT_MA_PER_COUNT);
-    int32_t iv_ma = (int32_t)((float)mcp3204_latest_raw[1] * CURRENT_MA_PER_COUNT);
-
+    int16_t iu_ma = (int16_t)((float)(mcp3204_latest_raw[0] - current_offset_raw) * CURRENT_MA_PER_COUNT);
+    int16_t iv_ma = (int16_t)((float)(mcp3204_latest_raw[1] - current_offset_raw) * CURRENT_MA_PER_COUNT);
+    int16_t I_alpha = iu_ma;
+    int16_t I_beta = ((iu_ma - iv_ma) * 37837) >> 16; // 1/sqrt(3) -> 0.577350269×65536≈37837
+    int16_t I_d = I_alpha * cosValues[elec_angle >> 4] + I_beta * sinValues[elec_angle >> 4];
+    int16_t I_q = -I_alpha * sinValues[elec_angle >> 4] + I_beta * cosValues[elec_angle >> 4];
+    I_d_global = I_d;
+    I_q_global = I_q;
     // 位相更新
     phase = phase & (PHASE_MAX - 1);
 
@@ -699,6 +706,7 @@ int main()
     {
         float s = (float)(2.0f * M_PI * (float)x) / (float)PHASE_RSL;
         sinValues[x] = sin(s);
+        cosValues[x] = cos(s);
         // printf(x + "\n");
     }
     for (int x = 0; x < 2 * PHASE_RSL; x++)
@@ -725,9 +733,9 @@ int main()
     {
         tud_task(); // HID + CDC USB task processing
         if (absolute_time_diff_us(get_absolute_time(), next_cdc_log) <= 0) {
-            cdc_logf("MCP3204 CH0=%4u CH1=%4u magnitude=%d angle=%d limRot=%d\r\n",
+            cdc_logf("MCP3204 CH0=%4u CH1=%4u magnitude=%d angle=%d limRot=%d I_d=%d I_q=%d\r\n",
                      mcp3204_latest_raw[0], mcp3204_latest_raw[1],
-                     ffb_magnitude, angle_core0, limitRot_core0);
+                     ffb_magnitude, angle_core0, limitRot_core0, I_d_global, I_q_global);
             next_cdc_log = make_timeout_time_ms(500);
         }
 
