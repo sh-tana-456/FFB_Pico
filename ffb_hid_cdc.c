@@ -28,8 +28,8 @@
 #include "hardware/dma.h"
 // 設定：使用GPIOピンと周波数
 #define PIN_UH 20
-#define PIN_VH 16
-#define PIN_WH 18
+#define PIN_VH 18
+#define PIN_WH 16
 #define PIN_U_SD PIN_UH + 1
 #define PIN_V_SD PIN_VH + 1
 #define PIN_W_SD PIN_WH + 1
@@ -45,7 +45,7 @@
 #define LED_FFB_ACTIVE 4     // FFBアクティブLED
 #define LED_FFB_MAGNITUDE 24 // FFBマグニチュードLED
 // 三相PWM設定
-#define CARRIER_FREQ_HZ 20000.0f // 20kHz キャリア
+#define CARRIER_FREQ_HZ 8000.0f // 20kHz キャリア
 #define SINE_FREQ_HZ 0.0f        // 変調周波数
 #define PHASE_MAX (1U << 31)
 #define PHASE_RSL (1U << 11)
@@ -65,9 +65,15 @@ static uint8_t mcp3204_dma_tx_buffer[MCP3204_BYTES_PER_SAMPLE];
 static uint8_t mcp3204_dma_rx_buffer[MCP3204_BYTES_PER_SAMPLE];
 static volatile bool mcp3204_dma_busy = false;
 static volatile bool mcp3204_sample_ready = false;
-static volatile uint16_t mcp3204_latest_raw[2] = {0, 0};
 static volatile uint8_t mcp3204_active_channel = 0;
 static volatile uint32_t mcp3204_dma_overrun_count = 0;
+static volatile uint16_t mcp3204_latest_raw[2] = {0, 0};
+static volatile uint16_t current_offset_u = 2048;
+static volatile uint16_t current_offset_v = 2048;
+static volatile uint32_t offset_sum_u = 0;
+static volatile uint32_t offset_sum_v = 0;
+static volatile uint16_t offset_count = 0;
+static volatile bool offset_calibrating = false;
 
 #define WHEEL_ANGLE 540 // degree
 #define REDUCTION_RATIO 4
@@ -75,7 +81,7 @@ static volatile uint32_t mcp3204_dma_overrun_count = 0;
 /*--------------共有変数------------*/
 volatile int32_t angle_share = 0;     // エンコーダーで読み取った角度
 volatile int32_t magnitude_share = 0; // FFB指令値
-volatile int8_t rotateNum_share = 0;  // モーターの原点からの回転回数
+volatile int32_t rotateNum_share = 0;  // モーターの原点からの回転回数
 volatile int8_t limitRot_share = 0;   // 回転制限 0 or 1
 spin_lock_t *lock;
 /*----------------------------------*/
@@ -85,13 +91,20 @@ volatile bool ffb_active = false;
 volatile uint8_t current_block_idx = 4;
 volatile bool effect_playing = false;
 volatile int32_t angle_core0 = 0;
-volatile int8_t rotateNum_core0 = 0;
+volatile int32_t rotateNum_core0 = 0;
 volatile int8_t limitRot_core0 = 0;
 
 uint16_t adc0 = 0;
 uint16_t apps_y = 0;
+
+int16_t I_u_global = 0;
+int16_t I_v_global = 0;
+int16_t I_alpha_global = 0;
+int16_t I_beta_global = 0;
 int16_t I_d_global = 0;
 int16_t I_q_global = 0;
+float Vu_global = 0.0f, Vv_global = 0.0f, Vw_global = 0.0f;
+float Vd_global = 0.0f, Vq_global = 0.0f;
 
 /*-------------only use in CORE1-------------*/
 // 位相変数（rad単位）、3相分はオフセットで扱う
@@ -105,7 +118,7 @@ uint32_t deadtime;
 uint slice_u, slice_v, slice_w;
 uint chan_u, chan_v, chan_w;
 float MR = 0.0f; // 変調率
-float torque_max = 0.10f;
+float torque_max = 0.2f;
 float sinValues[2 * PHASE_RSL];
 float cosValues[2 * PHASE_RSL];
 float rdmValues[2 * PHASE_RSL];
@@ -114,15 +127,51 @@ uint8_t enc_rx_buffer[12];
 uint8_t error = 0;
 volatile int32_t angle = 0, pre_angle = 0; // 17bit treated as 360deg
 volatile uint8_t direction_cmd = 0;        // 0:stop, 1:+, 2:-
-
-volatile int8_t rotateNum_core1 = 0;
+volatile int32_t rotateNum_core1 = 0;
 volatile int8_t limitRot_core1 = 0;
 const uint32_t angle_offset = 7420; // 生のエンコーダーの0点と物理ハンドルの0点を合わせるためのオフセット値
 volatile int32_t elec_angle = 0;
+volatile int32_t elec_angle_raw = 0;
+volatile int32_t electrical_offset = 32768 - 8829; // theta_e=0固定のときの電気角を差し引く
+volatile int32_t theta_e = 0;
 
-static volatile int32_t current_offset_raw = 2048;
-/*---------------------------------------------*/
+float Id_ref = 0.0f;
+float Iq_ref = 1000.0f;
+float error_d = 0.0f;
+float error_q = 0.0f;
 
+typedef struct {
+    float kp;
+    float ki;
+    float integral;
+    float out_min;
+    float out_max;
+} pi_controller_t;
+
+pi_controller_t pi_d = {
+    .kp = 0.0001f,
+    .ki = 0.001f,
+    .integral = 0.0f,
+    .out_min = -1.0f,
+    .out_max =  1.0f
+};
+
+pi_controller_t pi_q = {
+    .kp = 0.0001f,
+    .ki = 0.001f,
+    .integral = 0.0f,
+    .out_min = -1.0f,
+    .out_max =  1.0f
+};
+
+/*-------------------settings------------------*/
+typedef enum {
+    CONTROL_MODE_FFB = 0,
+    CONTROL_MODE_TORQUE = 1,
+    CONTROL_MODE_SPEED = 2,
+} control_mode_t;
+
+volatile control_mode_t control_mode = CONTROL_MODE_TORQUE; // 制御モード選択
 /*---------------------------------------------*/
 
 static void mcp3204_start_channel(uint8_t channel);
@@ -161,6 +210,21 @@ static void mcp3204_dma_irq_handler(void)
     {
         mcp3204_dma_busy = false;
         mcp3204_sample_ready = true;
+        // オフセットキャリブレーション
+        if (offset_calibrating)
+        {
+            offset_sum_u += mcp3204_latest_raw[0];
+            offset_sum_v += mcp3204_latest_raw[1];
+            offset_count++;
+
+            if (offset_count >= 10000)
+            {
+                current_offset_u = offset_sum_u / offset_count;
+                current_offset_v = offset_sum_v / offset_count;
+
+                offset_calibrating = false;
+            }
+        }
     }
 }
 
@@ -253,26 +317,87 @@ static void mcp3204_prepare_command(uint8_t channel)
     mcp3204_dma_tx_buffer[2] = 0x00;
 }
 
+static inline float pi_update(pi_controller_t *pi, float error, float dt){
+    float p = pi->kp * error;
+    float integral_new = pi->integral + pi->ki * error * dt;
+
+    float output = p + integral_new;
+
+    // 飽和
+    if (output > pi->out_max) {
+        output = pi->out_max;
+
+        // anti-windup
+        if (error < 0.0f)
+            pi->integral = integral_new;
+    }
+    else if (output < pi->out_min) {
+        output = pi->out_min;
+
+        // anti-windup
+        if (error > 0.0f)
+            pi->integral = integral_new;
+    }
+    else {
+        pi->integral = integral_new;
+    }
+    return output;
+}
+
 // wrap IRQ ハンドラ（例としてU相のラップIRQを使い、3相同時更新）
 void pwm_wrap_irq_handler()
 {
     // IRQ フラグクリア（U相スライス）
     pwm_clear_irq(slice_u);
     
-    int16_t iu_ma = (int16_t)((float)(mcp3204_latest_raw[0] - current_offset_raw) * CURRENT_MA_PER_COUNT);
-    int16_t iv_ma = (int16_t)((float)(mcp3204_latest_raw[1] - current_offset_raw) * CURRENT_MA_PER_COUNT);
+    // theta_e = 0;
+    int16_t iw_ma = (int16_t)((float)(mcp3204_latest_raw[0] - current_offset_u) * CURRENT_MA_PER_COUNT);
+    int16_t iv_ma = (int16_t)((float)(mcp3204_latest_raw[1] - current_offset_v) * CURRENT_MA_PER_COUNT);
+    int16_t iu_ma = -iw_ma - iv_ma;
     int16_t I_alpha = iu_ma;
-    int16_t I_beta = ((iu_ma - iv_ma) * 37837) >> 16; // 1/sqrt(3) -> 0.577350269×65536≈37837
-    int16_t I_d = I_alpha * cosValues[elec_angle >> 4] + I_beta * sinValues[elec_angle >> 4];
-    int16_t I_q = -I_alpha * sinValues[elec_angle >> 4] + I_beta * cosValues[elec_angle >> 4];
+    int16_t I_beta = ((iu_ma + 2 * iv_ma) * 37837) >> 16; // 1/sqrt(3) -> 0.577350269×65536≈37837
+    int16_t I_d = I_alpha * cosValues[theta_e >> 4] + I_beta * sinValues[theta_e >> 4];
+    int16_t I_q = -I_alpha * sinValues[theta_e >> 4] + I_beta * cosValues[theta_e >> 4];
+    I_u_global = iu_ma;
+    I_v_global = iv_ma;
+    I_alpha_global = I_alpha;
+    I_beta_global = I_beta;
     I_d_global = I_d;
     I_q_global = I_q;
+
+    error_d = Id_ref - I_d;
+    error_q = Iq_ref - I_q;
+
+    float Vd = pi_update(&pi_d, error_d, 1.0f / CARRIER_FREQ_HZ);
+    float Vq = pi_update(&pi_q, error_q, 1.0f / CARRIER_FREQ_HZ);
+    // float Vd = 0.0f;
+    // float Vq = 0.1f;
+    Vd_global = Vd;
+    Vq_global = Vq;
+
+    // 逆変換
+    float V_alpha = Vd * cosValues[theta_e >> 4]
+                  - Vq * sinValues[theta_e >> 4];
+
+    float V_beta  = Vd * sinValues[theta_e >> 4]
+                  + Vq * cosValues[theta_e >> 4];
+    float Vu = V_alpha;
+    float Vv = -0.5f * V_alpha + 0.8660254f * V_beta;
+    float Vw = -0.5f * V_alpha - 0.8660254f * V_beta;
+    Vu_global = Vu;
+    Vv_global = Vv;
+    Vw_global = Vw;
+
     // 位相更新
     phase = phase & (PHASE_MAX - 1);
+    phase = PHASE_MAX / 4 * 0;
 
     // 3相の振幅計算（浮動小数点 sinf)
     float su = 0, sv = 0, sw = 0;
-    if (rotate_mode == 1)
+    su = Vu;
+    sv = Vv;
+    sw = Vw;
+    if (control_mode == CONTROL_MODE_FFB && rotate_mode == 1)
     {
         // U相: θ
         su = sinValues[phase >> 20];
@@ -281,7 +406,7 @@ void pwm_wrap_irq_handler()
         // W相: θ + 240° = θ + 2π/3
         sw = sinValues[(phase >> 20) + 1365 /*→(2^11 * 2/3)*/];
     }
-    else if (rotate_mode == -1)
+    else if (control_mode == CONTROL_MODE_FFB && rotate_mode == -1)
     {
         // U相: θ
         su = sinValues[phase >> 20];
@@ -478,7 +603,7 @@ void uart1_receive()
 int decode_encoder_angle(uint8_t abs0, uint8_t abs1, uint8_t abs2)
 { // 17bitデータの復号 -65535~65535
     int32_t position = ((abs2 & 0x7F) << 16) + (abs1 << 8) + abs0 - angle_offset;
-    if (position > 131072 / 2)
+    if (position >= 131072 / 2)
     {
         position -= 131072;
     }
@@ -570,11 +695,13 @@ void tud_cdc_rx_cb(uint8_t itf)
     }
 }
 
-// core_1 モーター制御関係
-void core1_main()
+void ffb_process()
 {
     mcp3204_dma_init();
     mcp3204_start_read_dma();
+
+    sleep_ms(100);
+    offset_calibrating = true;
 
     gpio_init(PIN_U_SD);
     gpio_init(PIN_V_SD);
@@ -692,6 +819,244 @@ void core1_main()
         phase = phase_offset + (float)(elec_angle) / (float)(1 << 15) * (float)PHASE_MAX;
     }
 }
+
+void torque_mode_process()
+{
+    mcp3204_dma_init();
+    mcp3204_start_read_dma();
+
+    sleep_ms(100);
+    offset_calibrating = true;
+
+    gpio_init(PIN_U_SD);
+    gpio_init(PIN_V_SD);
+    gpio_init(PIN_W_SD);
+    gpio_set_dir(PIN_U_SD, GPIO_OUT);
+    gpio_set_dir(PIN_V_SD, GPIO_OUT);
+    gpio_set_dir(PIN_W_SD, GPIO_OUT);
+    // ゲートドライバ有効化
+    gpio_put(PIN_U_SD, 0);
+    gpio_put(PIN_V_SD, 0);
+    gpio_put(PIN_W_SD, 0);
+
+    // モーター制御用数値設定
+    phase = phase_offset;
+    angle = angle_offset;
+    int pre_elec = 0;
+    float torque = 0.0f;
+    int32_t local_magnitude = 10000, pre_local_magnitude = 0; // max 10000
+    float Kd = 0.0f, alpha = 0.001f, beta = 0.25f;
+    int delta_angle = 0, pre_delta_angle = 0, a = 0;
+
+    pwm_init_set();
+
+    while (true)
+    {
+        uart1_send(0x1A); // エンコーダーコマンド送信
+        sleep_us(100);
+        uart1_receive(); // エンコーダーデータ受信
+
+        pre_angle = angle;
+        pre_delta_angle = delta_angle;
+
+        angle = decode_encoder_angle(enc_rx_buffer[3], enc_rx_buffer[4], enc_rx_buffer[5]); // -65535~65535
+        delta_angle = angle - pre_angle;
+        if (delta_angle > 65535)
+        {
+            rotateNum_core1++;
+            delta_angle = 0;
+        }
+        else if (delta_angle < -65535)
+        {
+            rotateNum_core1--;
+            delta_angle = 0;
+        }
+        // 排他制御して読み込み
+        uint32_t irq = save_and_disable_interrupts();
+        spin_lock_unsafe_blocking(lock);
+        angle_share = angle;               // to core0
+        rotateNum_share = rotateNum_core1; // to core0
+        spin_unlock_unsafe(lock);
+        restore_interrupts(irq);
+
+        // 電気角算出
+        if (angle >= 0 && angle < 32768)
+        {
+            elec_angle = angle;
+        }
+        else if (angle >= 32768 && angle < 65536)
+        {
+            elec_angle = angle - 32768;
+        }
+        else if (angle >= -32768 && angle < 0)
+        {
+            elec_angle = 32768 + angle;
+        }
+        else if (angle >= -65536 && angle < -32768)
+        {
+            elec_angle = 65536 + angle;
+        }
+        else
+        {
+            error = 1;
+        }
+        elec_angle_raw = elec_angle;
+
+        torque = torque_max * (float)local_magnitude / 10000.f;
+        // if(rotateNum_core1!=0){MR = 0.07f;}else{MR = fabs(torque);} // (0.10f * fabs(angle) / 65536.f) +
+        MR = fabs(torque);
+
+        // 電気角オフセット
+        theta_e = (elec_angle + electrical_offset) & 0x7FFF;
+        elec_angle = (elec_angle + electrical_offset) & 0x7FFF;
+        phase = ((uint32_t)theta_e << 16);
+    }
+}
+
+void speed_mode_process()
+{
+    mcp3204_dma_init();
+    mcp3204_start_read_dma();
+
+    sleep_ms(100);
+    offset_calibrating = true;
+
+    gpio_init(PIN_U_SD);
+    gpio_init(PIN_V_SD);
+    gpio_init(PIN_W_SD);
+    gpio_set_dir(PIN_U_SD, GPIO_OUT);
+    gpio_set_dir(PIN_V_SD, GPIO_OUT);
+    gpio_set_dir(PIN_W_SD, GPIO_OUT);
+    gpio_put(PIN_U_SD, 1);
+    gpio_put(PIN_V_SD, 1);
+    gpio_put(PIN_W_SD, 1);
+
+    // モーター制御用数値設定
+    phase = phase_offset;
+    angle = angle_offset;
+    int pre_elec = 0;
+    float torque = 0.0f;
+    int32_t local_magnitude = 0, pre_local_magnitude = 0;
+    float Kd = 0.0f, alpha = 0.001f, beta = 0.25f;
+    int delta_angle = 0, pre_delta_angle = 0, a = 0;
+
+    pwm_init_set();
+
+    while (true)
+    {
+        uart1_send(0x1A); // エンコーダーコマンド送信
+        sleep_us(100);
+        uart1_receive(); // エンコーダーデータ受信
+
+        pre_angle = angle;
+        pre_delta_angle = delta_angle;
+        pre_local_magnitude = local_magnitude;
+
+        angle = decode_encoder_angle(enc_rx_buffer[3], enc_rx_buffer[4], enc_rx_buffer[5]); // -65535~65535
+        delta_angle = angle - pre_angle;
+        if (delta_angle > 65535)
+        {
+            rotateNum_core1++;
+            delta_angle = 0;
+        }
+        else if (delta_angle < -65535)
+        {
+            rotateNum_core1--;
+            delta_angle = 0;
+        }
+
+        // 排他制御して読み込み
+        uint32_t irq = save_and_disable_interrupts();
+        spin_lock_unsafe_blocking(lock);
+        local_magnitude = magnitude_share; // from core0
+        limitRot_core1 = limitRot_share;   // from core0
+        angle_share = angle;               // to core0
+        rotateNum_share = rotateNum_core1; // to core0
+        spin_unlock_unsafe(lock);
+        restore_interrupts(irq);
+
+        // 電気角算出
+        if (angle >= 0 && angle < 32768)
+        {
+            elec_angle = angle;
+        }
+        else if (angle >= 32768 && angle < 65536)
+        {
+            elec_angle = angle - 32768;
+        }
+        else if (angle >= -32768 && angle < 0)
+        {
+            elec_angle = 32768 + angle;
+        }
+        else if (angle >= -65536 && angle < -32768)
+        {
+            elec_angle = 65536 + angle;
+        }
+        else
+        {
+            error = 1;
+        }
+
+        pre_elec = elec_angle;
+
+        // 回転限界処理、粘性抵抗
+        delta_angle = pre_delta_angle * (1.0f - alpha) + delta_angle * alpha; // ωフィルタ
+        local_magnitude = pre_local_magnitude * (1.0f - beta) + local_magnitude * beta;
+        torque = -((float)delta_angle / 65536.f * Kd) + (torque_max * (float)local_magnitude / 10000.f);
+        // if(rotateNum_core1!=0){MR = 0.07f;}else{MR = fabs(torque);} // (0.10f * fabs(angle) / 65536.f) +
+        MR = fabs(torque);
+        if (limitRot_core1 > 0)
+        {
+            a = 8192;
+        }
+        else if (limitRot_core1 < 0)
+        {
+            a = -8192;
+        }
+        else
+        {
+            a = 0;
+            if (torque > 0)
+            {
+                a = -8192;
+            }
+            else if (torque < 0)
+            {
+                a = 8192;
+            }
+        }
+
+        elec_angle = (elec_angle + a); // 8192 = 90deg
+
+        // 位相計算
+        if (elec_angle < 0)
+        {
+            elec_angle = 32768 + elec_angle;
+        }
+        elec_angle = elec_angle & ((1 << 15) - 1);
+        phase = phase_offset + (float)(elec_angle) / (float)(1 << 15) * (float)PHASE_MAX;
+    }
+}
+
+// core_1 モーター制御関係
+void core1_main(){
+    switch (control_mode){
+    case CONTROL_MODE_FFB:
+        ffb_process();
+        break;
+
+    case CONTROL_MODE_TORQUE:
+        // トルク制御用
+        torque_mode_process();
+        break;
+
+    case CONTROL_MODE_SPEED:
+        // 回転数制御用
+        speed_mode_process();
+        break;
+    }
+}
+
 // core_0 USBデータ送信・メインループ
 int main()
 {
@@ -733,10 +1098,9 @@ int main()
     {
         tud_task(); // HID + CDC USB task processing
         if (absolute_time_diff_us(get_absolute_time(), next_cdc_log) <= 0) {
-            cdc_logf("MCP3204 CH0=%4u CH1=%4u magnitude=%d angle=%d limRot=%d I_d=%d I_q=%d\r\n",
-                     mcp3204_latest_raw[0], mcp3204_latest_raw[1],
-                     ffb_magnitude, angle_core0, limitRot_core0, I_d_global, I_q_global);
-            next_cdc_log = make_timeout_time_ms(500);
+            cdc_logf("Vd=%.2f Vq=%.2f angle=%d rotNum=%d theta_e=%d I_d=%d I_q=%d\r\n",
+                     Vd_global, Vq_global, angle_core0, rotateNum_core0, theta_e, I_d_global, I_q_global);
+            next_cdc_log = make_timeout_time_ms(200);
         }
 
         // 排他制御して読み込み
@@ -768,13 +1132,13 @@ int main()
         // sleep_ms(5);       // 約200Hzで送信
         gpio_put(LED_FFB_ACTIVE, ffb_active);
         gpio_put(LED_FFB_MAGNITUDE, ffb_magnitude != 0);
-        if (!ffb_active){
+        if (!ffb_active && control_mode == CONTROL_MODE_FFB){
             // 出力停止（magnitudeを保持してしまうため）
             ffb_magnitude = 0;
             gpio_put(PIN_U_SD, 1);
             gpio_put(PIN_V_SD, 1);
             gpio_put(PIN_W_SD, 1);
-        }else{
+        }else if (ffb_active && control_mode == CONTROL_MODE_FFB){
             // ゲートドライバ有効化
             gpio_put(PIN_U_SD, 0);
             gpio_put(PIN_V_SD, 0);
