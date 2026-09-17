@@ -41,39 +41,61 @@
 #define MCP3204_PIN_CS    13
 #define MCP3204_PIN_CLK   14
 #define MCP3204_PIN_DIN   15
+#define DEBUG_PIN 22     // デバッグ用GPIO
+#define DEBUG_PIN_2 23   // デバッグ用GPIO
+#define DEBUG_PIN_3 24   // デバッグ用GPIO
 
 #define LED_FFB_ACTIVE 4     // FFBアクティブLED
-#define LED_FFB_MAGNITUDE 24 // FFBマグニチュードLED
+#define LED_FFB_MAGNITUDE 25 // FFBマグニチュードLED
 // 三相PWM設定
-#define CARRIER_FREQ_HZ 8000.0f // 20kHz キャリア
+#define CARRIER_FREQ_HZ 20000.0f // 20kHz キャリア
 #define SINE_FREQ_HZ 0.0f        // 変調周波数
 #define PHASE_MAX (1U << 31)
 #define PHASE_RSL (1U << 11)
 // UART設定
 #define UART_ID_1 uart1
 #define UART_BAUD_1 2500000
+
+/*-----------------------for MCP3204----------------------*/
+static repeating_timer_t mcp3204_timer;
+static volatile bool mcp3204_timer_started = false;
 // SPI設定
 #define MCP3204_SPI       spi1
 #define CURRENT_MA_PER_COUNT (3.3f / 4095.f) / (0.044f / 1.0f) * 1000.0f
 
-#define MCP3204_SPI_HZ    1200000
+#define MCP3204_SPI_HZ     1000000//1200000
 #define MCP3204_NUM_CHANNELS     2
 #define MCP3204_BYTES_PER_SAMPLE 3
 static int mcp3204_dma_tx_channel = -1;
 static int mcp3204_dma_rx_channel = -1;
 static uint8_t mcp3204_dma_tx_buffer[MCP3204_BYTES_PER_SAMPLE];
 static uint8_t mcp3204_dma_rx_buffer[MCP3204_BYTES_PER_SAMPLE];
-static volatile bool mcp3204_dma_busy = false;
-static volatile bool mcp3204_sample_ready = false;
 static volatile uint8_t mcp3204_active_channel = 0;
 static volatile uint32_t mcp3204_dma_overrun_count = 0;
-static volatile uint16_t mcp3204_latest_raw[2] = {0, 0};
+static volatile uint16_t mcp3204_work_raw[2] = {0, 0}; // 一時格納用
+static volatile uint16_t mcp3204_latest_raw[2] = {0, 0}; // PWM割り込みで使用する最新値セット
 static volatile uint16_t current_offset_u = 2048;
 static volatile uint16_t current_offset_v = 2048;
 static volatile uint32_t offset_sum_u = 0;
 static volatile uint32_t offset_sum_v = 0;
 static volatile uint16_t offset_count = 0;
+static volatile bool mcp3204_dma_busy = false;
+static volatile bool mcp3204_sample_ready = false;
 static volatile bool offset_calibrating = false;
+
+static volatile bool spi_error = false;
+static volatile uint32_t spi_error_count = 0;
+/*---------------------------------------------*/
+// for UART encoder
+#define ENCODER_PACKET_SIZE 12
+
+static int uart1_rx_dma_channel = -1;
+
+static uint8_t uart1_dma_rx_buffer[ENCODER_PACKET_SIZE];
+
+volatile bool encoder_rx_busy = false;
+volatile bool encoder_packet_ready = false;
+/*---------------------------------------------*/
 
 #define WHEEL_ANGLE 540 // degree
 #define REDUCTION_RATIO 4
@@ -97,12 +119,12 @@ volatile int8_t limitRot_core0 = 0;
 uint16_t adc0 = 0;
 uint16_t apps_y = 0;
 
-int16_t I_u_global = 0;
-int16_t I_v_global = 0;
-int16_t I_alpha_global = 0;
-int16_t I_beta_global = 0;
-int16_t I_d_global = 0;
-int16_t I_q_global = 0;
+int32_t I_u_global = 0;
+int32_t I_v_global = 0;
+int32_t I_alpha_global = 0;
+int32_t I_beta_global = 0;
+int32_t I_d_global = 0;
+int32_t I_q_global = 0;
 float Vu_global = 0.0f, Vv_global = 0.0f, Vw_global = 0.0f;
 float Vd_global = 0.0f, Vq_global = 0.0f;
 
@@ -118,7 +140,7 @@ uint32_t deadtime;
 uint slice_u, slice_v, slice_w;
 uint chan_u, chan_v, chan_w;
 float MR = 0.0f; // 変調率
-float torque_max = 0.2f;
+float torque_max = 0.4f;
 float sinValues[2 * PHASE_RSL];
 float cosValues[2 * PHASE_RSL];
 float rdmValues[2 * PHASE_RSL];
@@ -136,7 +158,7 @@ volatile int32_t electrical_offset = 32768 - 8829; // theta_e=0固定のとき�
 volatile int32_t theta_e = 0;
 
 float Id_ref = 0.0f;
-float Iq_ref = 1000.0f;
+float Iq_ref = -500.0f;
 float error_d = 0.0f;
 float error_q = 0.0f;
 
@@ -157,7 +179,7 @@ pi_controller_t pi_d = {
 };
 
 pi_controller_t pi_q = {
-    .kp = 0.0001f,
+    .kp = 0.0002f,
     .ki = 0.001f,
     .integral = 0.0f,
     .out_min = -1.0f,
@@ -176,6 +198,11 @@ volatile control_mode_t control_mode = CONTROL_MODE_TORQUE; // 制御モード�
 
 static void mcp3204_start_channel(uint8_t channel);
 static void mcp3204_prepare_command(uint8_t channel);
+static bool uart1_start_rx_dma(void);
+static void uart1_rx_dma_irq_handler(void);
+static bool encoder_request(void);
+static bool encoder_process_packet(void);
+static void cdc_logf(const char *fmt, ...);
 
 int apply_limit(int value, int max)
 {
@@ -200,7 +227,7 @@ static void mcp3204_dma_irq_handler(void)
         ((mcp3204_dma_rx_buffer[1] & 0x0F) << 8) |
         mcp3204_dma_rx_buffer[2];
 
-    mcp3204_latest_raw[mcp3204_active_channel] = raw;
+    mcp3204_work_raw[mcp3204_active_channel] = raw;
 
     if (mcp3204_active_channel < MCP3204_NUM_CHANNELS - 1)
     {
@@ -208,7 +235,19 @@ static void mcp3204_dma_irq_handler(void)
     }
     else
     {
+        if (mcp3204_work_raw[0] < 200 || mcp3204_work_raw[0] > 4000 || mcp3204_work_raw[1] < 200 || mcp3204_work_raw[1] > 4000)
+        {
+            spi_error_count++;
+            spi_error = true;
+        }
+        else
+        {
+            spi_error = false;
+            mcp3204_latest_raw[0] = mcp3204_work_raw[0];
+            mcp3204_latest_raw[1] = mcp3204_work_raw[1];
+        }
         mcp3204_dma_busy = false;
+        gpio_put(DEBUG_PIN_3, spi_error);
         mcp3204_sample_ready = true;
         // オフセットキャリブレーション
         if (offset_calibrating)
@@ -225,6 +264,7 @@ static void mcp3204_dma_irq_handler(void)
                 offset_calibrating = false;
             }
         }
+        gpio_put(DEBUG_PIN_2, !gpio_get(DEBUG_PIN_2));
     }
 }
 
@@ -317,7 +357,48 @@ static void mcp3204_prepare_command(uint8_t channel)
     mcp3204_dma_tx_buffer[2] = 0x00;
 }
 
-static inline float pi_update(pi_controller_t *pi, float error, float dt){
+static bool mcp3204_timer_callback(repeating_timer_t *rt)
+{
+    (void)rt;
+
+    /*
+     * ADC DMAがまだ動いている場合は何もしない。
+     * mcp3204_start_read_dma()側にもbusyチェックがあるので
+     * 二重チェックになります。
+     */
+    (void)mcp3204_start_read_dma();
+
+    return true;    // タイマーを継続
+}
+
+static void mcp3204_timer_start(void)
+{
+    if (mcp3204_timer_started) {
+        return;
+    }
+    /*
+     * 10kHz = 100us周期
+     *
+     * delay_usを負にすると、前回のスケジュール時刻基準で
+     * 次回を設定するので、周期が安定します。
+     */
+    bool ok = add_repeating_timer_us(
+        -100,                       // 100us = 10kHz
+        mcp3204_timer_callback,
+        NULL,
+        &mcp3204_timer
+    );
+
+    if (!ok) {
+        mcp3204_timer_started = false;
+        return;
+    }
+
+    mcp3204_timer_started = true;
+}
+
+static inline float pi_update(pi_controller_t *pi, float error, float dt)
+{
     float p = pi->kp * error;
     float integral_new = pi->integral + pi->ki * error * dt;
 
@@ -349,31 +430,24 @@ void pwm_wrap_irq_handler()
 {
     // IRQ フラグクリア（U相スライス）
     pwm_clear_irq(slice_u);
+    gpio_put(DEBUG_PIN, 1);
     
     // theta_e = 0;
-    int16_t iw_ma = (int16_t)((float)(mcp3204_latest_raw[0] - current_offset_u) * CURRENT_MA_PER_COUNT);
-    int16_t iv_ma = (int16_t)((float)(mcp3204_latest_raw[1] - current_offset_v) * CURRENT_MA_PER_COUNT);
-    int16_t iu_ma = -iw_ma - iv_ma;
-    int16_t I_alpha = iu_ma;
-    int16_t I_beta = ((iu_ma + 2 * iv_ma) * 37837) >> 16; // 1/sqrt(3) -> 0.577350269×65536≈37837
-    int16_t I_d = I_alpha * cosValues[theta_e >> 4] + I_beta * sinValues[theta_e >> 4];
-    int16_t I_q = -I_alpha * sinValues[theta_e >> 4] + I_beta * cosValues[theta_e >> 4];
-    I_u_global = iu_ma;
-    I_v_global = iv_ma;
-    I_alpha_global = I_alpha;
-    I_beta_global = I_beta;
-    I_d_global = I_d;
-    I_q_global = I_q;
+    int32_t iw_ma = (int32_t)((float)((int32_t)mcp3204_latest_raw[0] - (int32_t)current_offset_u) * CURRENT_MA_PER_COUNT);
+    int32_t iv_ma = (int32_t)((float)((int32_t)mcp3204_latest_raw[1] - (int32_t)current_offset_v) * CURRENT_MA_PER_COUNT);
+    int32_t iu_ma = -iw_ma - iv_ma;
+    int32_t I_alpha = iu_ma;
+    int32_t I_beta = ((iu_ma + 2 * iv_ma) * 37837) >> 16; // 1/sqrt(3) -> 0.577350269×65536≈37837
+    int32_t I_d = I_alpha * cosValues[theta_e >> 4] + I_beta * sinValues[theta_e >> 4];
+    int32_t I_q = -I_alpha * sinValues[theta_e >> 4] + I_beta * cosValues[theta_e >> 4];
 
-    error_d = Id_ref - I_d;
-    error_q = Iq_ref - I_q;
+    error_d = Id_ref - (float)I_d;
+    error_q = Iq_ref - (float)I_q;
 
     float Vd = pi_update(&pi_d, error_d, 1.0f / CARRIER_FREQ_HZ);
     float Vq = pi_update(&pi_q, error_q, 1.0f / CARRIER_FREQ_HZ);
-    // float Vd = 0.0f;
-    // float Vq = 0.1f;
-    Vd_global = Vd;
-    Vq_global = Vq;
+    // Vd = 0.0f;
+    // Vq = 0.2f;
 
     // 逆変換
     float V_alpha = Vd * cosValues[theta_e >> 4]
@@ -384,6 +458,15 @@ void pwm_wrap_irq_handler()
     float Vu = V_alpha;
     float Vv = -0.5f * V_alpha + 0.8660254f * V_beta;
     float Vw = -0.5f * V_alpha - 0.8660254f * V_beta;
+
+    I_u_global = iu_ma;
+    I_v_global = iv_ma;
+    I_alpha_global = I_alpha;
+    I_beta_global = I_beta;
+    I_d_global = I_d;
+    I_q_global = I_q;
+    Vd_global = Vd;
+    Vq_global = Vq;
     Vu_global = Vu;
     Vv_global = Vv;
     Vw_global = Vw;
@@ -427,8 +510,10 @@ void pwm_wrap_irq_handler()
     pwm_set_chan_level(slice_u, !chan_u, apply_limit(du + deadtime / 2, wrap_val));
     pwm_set_chan_level(slice_v, !chan_v, apply_limit(dv + deadtime / 2, wrap_val));
     pwm_set_chan_level(slice_w, !chan_w, apply_limit(dw + deadtime / 2, wrap_val));
+
     // 次割り込み用のADC読み込み開始
-    (void)mcp3204_start_read_dma();
+    // (void)mcp3204_start_read_dma();
+    gpio_put(DEBUG_PIN, 0);
 }
 
 void pwm_init_set()
@@ -542,6 +627,119 @@ void send_hid_report()
     }
 }
 
+static bool encoder_request(void)
+{
+    // 前回の通信がまだ終わっている場合は何もしない
+    if (encoder_rx_busy || encoder_packet_ready)
+        return false;
+
+    // まず古いUART RX FIFOを捨てる
+    while (uart_is_readable(UART_ID_1))
+    {
+        (void)uart_getc(UART_ID_1);
+    }
+    //  * RX DMAを先にARMする
+    //  * ここではまだRS485のRXを有効にはしない。
+    //  * DMAはUART RX FIFOにデータが入るまで待機する。
+    if (!uart1_start_rx_dma())
+    {
+        return false;
+    }
+
+    // UART送信、DE・REピン切り替えは割り込み禁止状態で行う
+    uint32_t irq = save_and_disable_interrupts();
+    // 送信モードに切り替え
+    gpio_put(RE_PIN, 1); // 受信無効
+    gpio_put(DE_PIN, 1); // 送信有効
+    //  送信前にRX FIFOをクリアしておく（古いデータ・ノイズ排除）
+    while (uart_is_readable(UART_ID_1))
+    {
+        (void)uart_getc(UART_ID_1);
+    }
+    // UART送信
+    // uart_write_blocking は内部でFIFOに書き込み、そのまま戻る
+    uint8_t cmd = 0x1A;
+    uart_write_blocking(UART_ID_1, &cmd, 1);
+
+    // 送信完了待ち: 1バイト/2.5Mbps ≈ 3.2μs。確実に送出完了させるため、数十μs待機
+    // UARTハードウェアレジスタで直にBUSYを確認
+    while (uart_get_hw(UART_ID_1)->fr & UART_UARTFR_BUSY_BITS) {
+        tight_loop_contents();
+    }
+    // 受信モードに戻す
+    gpio_put(RE_PIN, 0);
+    gpio_put(DE_PIN, 0);
+    restore_interrupts(irq);
+
+    return true;
+}
+
+static bool encoder_process_packet(void)
+{
+    if (!encoder_packet_ready)
+        return false;
+
+    // DMAは12byte転送完了して停止しているので、
+    // ここではバッファを安全に読むことができる
+    memcpy(
+        enc_rx_buffer,
+        uart1_dma_rx_buffer,
+        ENCODER_PACKET_SIZE
+    );
+
+    encoder_packet_ready = false;
+
+    return true;
+}
+
+int decode_encoder_angle(uint8_t abs0, uint8_t abs1, uint8_t abs2)
+{ // 17bitデータの復号 -65535~65535
+    int32_t position = ((abs2 & 0x7F) << 16) + (abs1 << 8) + abs0 - angle_offset;
+    if (position >= 131072 / 2)
+    {
+        position -= 131072;
+    }
+    if (position < -131072 / 2)
+    {
+        position += 131072;
+    }
+    return position;
+}
+
+static void uart1_rx_dma_irq_handler(void)
+{
+    uint32_t mask = 1u << uart1_rx_dma_channel;
+
+    if (dma_hw->ints1 & mask) {
+        dma_hw->ints1 = mask;
+
+        encoder_rx_busy = false;
+        encoder_packet_ready = true;
+    }
+}
+
+static bool uart1_start_rx_dma(void)
+{
+    if (encoder_rx_busy)
+        return false;
+
+    // DMA割り込みをクリア
+    dma_hw->ints1 = 1u << uart1_rx_dma_channel;
+    encoder_rx_busy = true;
+    encoder_packet_ready = false;
+    
+    // 受信先RAMを先頭に戻す
+    dma_channel_set_write_addr( uart1_rx_dma_channel, uart1_dma_rx_buffer, false);
+    // UART1 DRを読み出す
+    dma_channel_set_read_addr(uart1_rx_dma_channel, &uart_get_hw(UART_ID_1)->dr, false);
+    // 12 byte受信
+    dma_channel_set_trans_count(uart1_rx_dma_channel, ENCODER_PACKET_SIZE, false);
+    // DMA開始
+    dma_start_channel_mask(1u << uart1_rx_dma_channel);
+
+    return true;
+}
+
 // UART function
 void uart1_send(uint8_t cmd)
 {
@@ -569,6 +767,7 @@ void uart1_send(uint8_t cmd)
     gpio_put(DE_PIN, 0);
     restore_interrupts(irq);
 }
+
 // エンコーダー受信用
 void uart1_receive()
 {
@@ -599,20 +798,6 @@ void uart1_receive()
         }
     }
 }
-// エンコーダーデコード : 17bitデータの復号 (-65535~65535) 0点を物理ハンドルと合わせるためオフセット有り
-int decode_encoder_angle(uint8_t abs0, uint8_t abs1, uint8_t abs2)
-{ // 17bitデータの復号 -65535~65535
-    int32_t position = ((abs2 & 0x7F) << 16) + (abs1 << 8) + abs0 - angle_offset;
-    if (position >= 131072 / 2)
-    {
-        position -= 131072;
-    }
-    if (position < -131072 / 2)
-    {
-        position += 131072;
-    }
-    return position;
-}
 
 void uart_init_set()
 {
@@ -637,34 +822,18 @@ void uart_init_set()
     sleep_ms(1);
     uart1_send(0xEA);
     sleep_ms(1);
-}
-// 電流センサ出力を読む
-static uint16_t mcp3204_read_raw(uint8_t channel)
-{
-    if (channel > 3) {
-        return 0;
-    }
 
-    uint8_t tx[3] = {
-        0x06,
-        (uint8_t)(channel << 6),
-        0x00
-    };
-
-    uint8_t rx[3] = {0};
-
-    gpio_put(MCP3204_PIN_CS, 0);
-
-    spi_write_read_blocking(
-        MCP3204_SPI,
-        tx,
-        rx,
-        sizeof(tx)
-    );
-
-    gpio_put(MCP3204_PIN_CS, 1);
-
-    return (uint16_t)(((uint16_t)(rx[1] & 0x0f) << 8) | rx[2]);
+    uart1_rx_dma_channel = dma_claim_unused_channel(true);
+    dma_channel_config c = dma_channel_get_default_config(uart1_rx_dma_channel);
+    channel_config_set_transfer_data_size(&c, DMA_SIZE_8);
+    channel_config_set_read_increment(&c, false);
+    channel_config_set_write_increment(&c, true);
+    // UART RX FIFOに1byte以上入ったらDMA request
+    channel_config_set_dreq(&c, uart_get_dreq(UART_ID_1, false));
+    dma_channel_configure(uart1_rx_dma_channel, &c, uart1_dma_rx_buffer, &uart_get_hw(UART_ID_1)->dr, ENCODER_PACKET_SIZE, false);
+    dma_channel_set_irq1_enabled(uart1_rx_dma_channel, true);
+    irq_set_exclusive_handler(DMA_IRQ_1, uart1_rx_dma_irq_handler);
+    irq_set_enabled(DMA_IRQ_1, true);
 }
 
 // TinyUSB CDC logging. Do not enable pico_stdio_usb concurrently.
@@ -823,7 +992,8 @@ void ffb_process()
 void torque_mode_process()
 {
     mcp3204_dma_init();
-    mcp3204_start_read_dma();
+    /* タイマーからADC取得を開始 */
+    mcp3204_timer_start();
 
     sleep_ms(100);
     offset_calibrating = true;
@@ -831,6 +1001,12 @@ void torque_mode_process()
     gpio_init(PIN_U_SD);
     gpio_init(PIN_V_SD);
     gpio_init(PIN_W_SD);
+    gpio_init(DEBUG_PIN);
+    gpio_init(DEBUG_PIN_2);
+    gpio_init(DEBUG_PIN_3);
+    gpio_set_dir(DEBUG_PIN, GPIO_OUT);
+    gpio_set_dir(DEBUG_PIN_2, GPIO_OUT);
+    gpio_set_dir(DEBUG_PIN_3, GPIO_OUT);
     gpio_set_dir(PIN_U_SD, GPIO_OUT);
     gpio_set_dir(PIN_V_SD, GPIO_OUT);
     gpio_set_dir(PIN_W_SD, GPIO_OUT);
@@ -852,14 +1028,14 @@ void torque_mode_process()
 
     while (true)
     {
-        uart1_send(0x1A); // エンコーダーコマンド送信
-        sleep_us(100);
-        uart1_receive(); // エンコーダーデータ受信
-
         pre_angle = angle;
         pre_delta_angle = delta_angle;
 
-        angle = decode_encoder_angle(enc_rx_buffer[3], enc_rx_buffer[4], enc_rx_buffer[5]); // -65535~65535
+        if (encoder_packet_ready && encoder_process_packet())
+        {
+            angle = decode_encoder_angle(enc_rx_buffer[3], enc_rx_buffer[4], enc_rx_buffer[5]); // -65535~65535
+        }
+        
         delta_angle = angle - pre_angle;
         if (delta_angle > 65535)
         {
@@ -908,8 +1084,12 @@ void torque_mode_process()
 
         // 電気角オフセット
         theta_e = (elec_angle + electrical_offset) & 0x7FFF;
-        elec_angle = (elec_angle + electrical_offset) & 0x7FFF;
-        phase = ((uint32_t)theta_e << 16);
+
+        // 次のエンコーダーリクエスト送信
+        if (!encoder_rx_busy && !encoder_packet_ready)
+        {
+            encoder_request();
+        }
     }
 }
 
@@ -1039,7 +1219,8 @@ void speed_mode_process()
 }
 
 // core_1 モーター制御関係
-void core1_main(){
+void core1_main()
+{
     switch (control_mode){
     case CONTROL_MODE_FFB:
         ffb_process();
@@ -1098,8 +1279,8 @@ int main()
     {
         tud_task(); // HID + CDC USB task processing
         if (absolute_time_diff_us(get_absolute_time(), next_cdc_log) <= 0) {
-            cdc_logf("Vd=%.2f Vq=%.2f angle=%d rotNum=%d theta_e=%d I_d=%d I_q=%d\r\n",
-                     Vd_global, Vq_global, angle_core0, rotateNum_core0, theta_e, I_d_global, I_q_global);
+            cdc_logf("Vd=%.2f Vq=%.2f spi_error=%d angle=%d rotNum=%d theta_e=%d CH0=%d CH1=%d I_d=%d I_q=%d\r\n",
+                     Vd_global, Vq_global, spi_error_count, angle_core0, rotateNum_core0, theta_e, mcp3204_latest_raw[0], mcp3204_latest_raw[1], I_d_global, I_q_global);
             next_cdc_log = make_timeout_time_ms(200);
         }
 
