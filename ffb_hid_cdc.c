@@ -48,7 +48,7 @@
 #define LED_FFB_ACTIVE 4     // FFBアクティブLED
 #define LED_FFB_MAGNITUDE 25 // FFBマグニチュードLED
 // 三相PWM設定
-#define CARRIER_FREQ_HZ 20000.0f // 20kHz キャリア
+#define CARRIER_FREQ_HZ 8000.0f // 20kHz キャリア
 #define SINE_FREQ_HZ 0.0f        // 変調周波数
 #define PHASE_MAX (1U << 31)
 #define PHASE_RSL (1U << 11)
@@ -82,6 +82,11 @@ static volatile uint16_t offset_count = 0;
 static volatile bool mcp3204_dma_busy = false;
 static volatile bool mcp3204_sample_ready = false;
 static volatile bool offset_calibrating = false;
+
+static float current_lpf_ch0 = 2048.0f;
+static float current_lpf_ch1 = 2048.0f;
+#define CURRENT_LPF_HZ 2000.0f
+#define CURRENT_LPF_ALPHA (1.0f - expf(-2.0f * (float)M_PI * CURRENT_LPF_HZ / CARRIER_FREQ_HZ))
 
 static volatile bool spi_error = false;
 static volatile uint32_t spi_error_count = 0;
@@ -140,7 +145,7 @@ uint32_t deadtime;
 uint slice_u, slice_v, slice_w;
 uint chan_u, chan_v, chan_w;
 float MR = 0.0f; // 変調率
-float torque_max = 0.4f;
+float torque_max = 0.2f; // 最大変調率設定
 float sinValues[2 * PHASE_RSL];
 float cosValues[2 * PHASE_RSL];
 float rdmValues[2 * PHASE_RSL];
@@ -158,7 +163,7 @@ volatile int32_t electrical_offset = 32768 - 8829; // theta_e=0固定のとき�
 volatile int32_t theta_e = 0;
 
 float Id_ref = 0.0f;
-float Iq_ref = -500.0f;
+float Iq_ref = 0.0f;
 float error_d = 0.0f;
 float error_q = 0.0f;
 
@@ -172,15 +177,15 @@ typedef struct {
 
 pi_controller_t pi_d = {
     .kp = 0.0001f,
-    .ki = 0.001f,
+    .ki = 0.01f,
     .integral = 0.0f,
     .out_min = -1.0f,
     .out_max =  1.0f
 };
 
 pi_controller_t pi_q = {
-    .kp = 0.0002f,
-    .ki = 0.001f,
+    .kp = 0.0001f,
+    .ki = 0.05f,
     .integral = 0.0f,
     .out_min = -1.0f,
     .out_max =  1.0f
@@ -193,7 +198,7 @@ typedef enum {
     CONTROL_MODE_SPEED = 2,
 } control_mode_t;
 
-volatile control_mode_t control_mode = CONTROL_MODE_TORQUE; // 制御モード選択
+volatile control_mode_t control_mode = CONTROL_MODE_FFB; // 制御モード選択
 /*---------------------------------------------*/
 
 static void mcp3204_start_channel(uint8_t channel);
@@ -243,8 +248,10 @@ static void mcp3204_dma_irq_handler(void)
         else
         {
             spi_error = false;
-            mcp3204_latest_raw[0] = mcp3204_work_raw[0];
-            mcp3204_latest_raw[1] = mcp3204_work_raw[1];
+            current_lpf_ch0 = CURRENT_LPF_ALPHA * mcp3204_work_raw[0] + (1.0f - CURRENT_LPF_ALPHA) * current_lpf_ch0;
+            current_lpf_ch1 = CURRENT_LPF_ALPHA * mcp3204_work_raw[1] + (1.0f - CURRENT_LPF_ALPHA) * current_lpf_ch1;
+            mcp3204_latest_raw[0] = current_lpf_ch0;
+            mcp3204_latest_raw[1] = current_lpf_ch1;
         }
         mcp3204_dma_busy = false;
         gpio_put(DEBUG_PIN_3, spi_error);
@@ -357,46 +364,6 @@ static void mcp3204_prepare_command(uint8_t channel)
     mcp3204_dma_tx_buffer[2] = 0x00;
 }
 
-static bool mcp3204_timer_callback(repeating_timer_t *rt)
-{
-    (void)rt;
-
-    /*
-     * ADC DMAがまだ動いている場合は何もしない。
-     * mcp3204_start_read_dma()側にもbusyチェックがあるので
-     * 二重チェックになります。
-     */
-    (void)mcp3204_start_read_dma();
-
-    return true;    // タイマーを継続
-}
-
-static void mcp3204_timer_start(void)
-{
-    if (mcp3204_timer_started) {
-        return;
-    }
-    /*
-     * 10kHz = 100us周期
-     *
-     * delay_usを負にすると、前回のスケジュール時刻基準で
-     * 次回を設定するので、周期が安定します。
-     */
-    bool ok = add_repeating_timer_us(
-        -100,                       // 100us = 10kHz
-        mcp3204_timer_callback,
-        NULL,
-        &mcp3204_timer
-    );
-
-    if (!ok) {
-        mcp3204_timer_started = false;
-        return;
-    }
-
-    mcp3204_timer_started = true;
-}
-
 static inline float pi_update(pi_controller_t *pi, float error, float dt)
 {
     float p = pi->kp * error;
@@ -425,14 +392,16 @@ static inline float pi_update(pi_controller_t *pi, float error, float dt)
     return output;
 }
 
-// wrap IRQ ハンドラ（例としてU相のラップIRQを使い、3相同時更新）
+// wrap IRQ ハンドラ
+// PWM割り込みでADC読み込み開始、電流計算、PI制御、デューティ計算を行う
 void pwm_wrap_irq_handler()
 {
     // IRQ フラグクリア（U相スライス）
     pwm_clear_irq(slice_u);
     gpio_put(DEBUG_PIN, 1);
-    
-    // theta_e = 0;
+    // 次割り込み用のADC読み込み開始
+    (void)mcp3204_start_read_dma();
+
     int32_t iw_ma = (int32_t)((float)((int32_t)mcp3204_latest_raw[0] - (int32_t)current_offset_u) * CURRENT_MA_PER_COUNT);
     int32_t iv_ma = (int32_t)((float)((int32_t)mcp3204_latest_raw[1] - (int32_t)current_offset_v) * CURRENT_MA_PER_COUNT);
     int32_t iu_ma = -iw_ma - iv_ma;
@@ -446,15 +415,11 @@ void pwm_wrap_irq_handler()
 
     float Vd = pi_update(&pi_d, error_d, 1.0f / CARRIER_FREQ_HZ);
     float Vq = pi_update(&pi_q, error_q, 1.0f / CARRIER_FREQ_HZ);
-    // Vd = 0.0f;
-    // Vq = 0.2f;
 
     // 逆変換
-    float V_alpha = Vd * cosValues[theta_e >> 4]
-                  - Vq * sinValues[theta_e >> 4];
+    float V_alpha = Vd * cosValues[theta_e >> 4] - Vq * sinValues[theta_e >> 4];
+    float V_beta  = Vd * sinValues[theta_e >> 4] + Vq * cosValues[theta_e >> 4];
 
-    float V_beta  = Vd * sinValues[theta_e >> 4]
-                  + Vq * cosValues[theta_e >> 4];
     float Vu = V_alpha;
     float Vv = -0.5f * V_alpha + 0.8660254f * V_beta;
     float Vw = -0.5f * V_alpha - 0.8660254f * V_beta;
@@ -471,33 +436,12 @@ void pwm_wrap_irq_handler()
     Vv_global = Vv;
     Vw_global = Vw;
 
-    // 位相更新
-    phase = phase & (PHASE_MAX - 1);
-    phase = PHASE_MAX / 4 * 0;
-
     // 3相の振幅計算（浮動小数点 sinf)
-    float su = 0, sv = 0, sw = 0;
+    float su = 0.0f, sv = 0.0f, sw = 0.0f;
     su = Vu;
     sv = Vv;
     sw = Vw;
-    if (control_mode == CONTROL_MODE_FFB && rotate_mode == 1)
-    {
-        // U相: θ
-        su = sinValues[phase >> 20];
-        // V相: θ + 120° = θ + 4π/3
-        sv = sinValues[(phase >> 20) + 683 /*→(2^11 * 1/3)*/];
-        // W相: θ + 240° = θ + 2π/3
-        sw = sinValues[(phase >> 20) + 1365 /*→(2^11 * 2/3)*/];
-    }
-    else if (control_mode == CONTROL_MODE_FFB && rotate_mode == -1)
-    {
-        // U相: θ
-        su = sinValues[phase >> 20];
-        // V相: θ + 240° = θ + 2π/3
-        sv = sinValues[(phase >> 20) + 1365 /*→(2^11 * 2/3)*/];
-        // W相: θ + 120° = θ + 4π/3
-        sw = sinValues[(phase >> 20) + 683 /*→(2^11 * 1/3)*/];
-    }
+
     // デューティ（0 ～ wrap_val）の計算: (sin*0.5 + 0.5) を乗算
     uint32_t du = (uint32_t)(MR * (su * 0.5f + 0.5f) * (float)wrap_val); // + rdmValues[phase >> 20]
     uint32_t dv = (uint32_t)(MR * (sv * 0.5f + 0.5f) * (float)wrap_val); // + rdmValues[(phase >> 20) + 683]
@@ -511,8 +455,6 @@ void pwm_wrap_irq_handler()
     pwm_set_chan_level(slice_v, !chan_v, apply_limit(dv + deadtime / 2, wrap_val));
     pwm_set_chan_level(slice_w, !chan_w, apply_limit(dw + deadtime / 2, wrap_val));
 
-    // 次割り込み用のADC読み込み開始
-    // (void)mcp3204_start_read_dma();
     gpio_put(DEBUG_PIN, 0);
 }
 
@@ -875,19 +817,26 @@ void ffb_process()
     gpio_init(PIN_U_SD);
     gpio_init(PIN_V_SD);
     gpio_init(PIN_W_SD);
+    gpio_init(DEBUG_PIN);
+    gpio_init(DEBUG_PIN_2);
+    gpio_init(DEBUG_PIN_3);
+    gpio_set_dir(DEBUG_PIN, GPIO_OUT);
+    gpio_set_dir(DEBUG_PIN_2, GPIO_OUT);
+    gpio_set_dir(DEBUG_PIN_3, GPIO_OUT);
     gpio_set_dir(PIN_U_SD, GPIO_OUT);
     gpio_set_dir(PIN_V_SD, GPIO_OUT);
     gpio_set_dir(PIN_W_SD, GPIO_OUT);
-    gpio_put(PIN_U_SD, 1);
-    gpio_put(PIN_V_SD, 1);
-    gpio_put(PIN_W_SD, 1);
+    // ゲートドライバ有効化
+    gpio_put(PIN_U_SD, 0);
+    gpio_put(PIN_V_SD, 0);
+    gpio_put(PIN_W_SD, 0);
 
     // モーター制御用数値設定
     phase = phase_offset;
     angle = angle_offset;
     int pre_elec = 0;
     float torque = 0.0f;
-    int32_t local_magnitude = 0, pre_local_magnitude = 0;
+    int32_t local_magnitude = 0, pre_local_magnitude = 0; // max 10000
     float Kd = 0.0f, alpha = 0.001f, beta = 0.25f;
     int delta_angle = 0, pre_delta_angle = 0, a = 0;
 
@@ -895,15 +844,14 @@ void ffb_process()
 
     while (true)
     {
-        uart1_send(0x1A); // エンコーダーコマンド送信
-        sleep_us(100);
-        uart1_receive(); // エンコーダーデータ受信
-
         pre_angle = angle;
         pre_delta_angle = delta_angle;
-        pre_local_magnitude = local_magnitude;
 
-        angle = decode_encoder_angle(enc_rx_buffer[3], enc_rx_buffer[4], enc_rx_buffer[5]); // -65535~65535
+        if (encoder_packet_ready && encoder_process_packet())
+        {
+            angle = decode_encoder_angle(enc_rx_buffer[3], enc_rx_buffer[4], enc_rx_buffer[5]); // -65535~65535
+        }
+        
         delta_angle = angle - pre_angle;
         if (delta_angle > 65535)
         {
@@ -915,7 +863,6 @@ void ffb_process()
             rotateNum_core1--;
             delta_angle = 0;
         }
-
         // 排他制御して読み込み
         uint32_t irq = save_and_disable_interrupts();
         spin_lock_unsafe_blocking(lock);
@@ -947,53 +894,27 @@ void ffb_process()
         {
             error = 1;
         }
+        elec_angle_raw = elec_angle;
 
-        pre_elec = elec_angle;
+        MR = torque_max;
+        Iq_ref = (float)local_magnitude / 2.0f;
+        Id_ref = 0.0f;
 
-        // 回転限界処理、粘性抵抗
-        delta_angle = pre_delta_angle * (1.0f - alpha) + delta_angle * alpha; // ωフィルタ
-        local_magnitude = pre_local_magnitude * (1.0f - beta) + local_magnitude * beta;
-        torque = -((float)delta_angle / 65536.f * Kd) + (torque_max * (float)local_magnitude / 10000.f);
-        // if(rotateNum_core1!=0){MR = 0.07f;}else{MR = fabs(torque);} // (0.10f * fabs(angle) / 65536.f) +
-        MR = fabs(torque);
-        if (limitRot_core1 > 0)
-        {
-            a = 8192;
-        }
-        else if (limitRot_core1 < 0)
-        {
-            a = -8192;
-        }
-        else
-        {
-            a = 0;
-            if (torque > 0)
-            {
-                a = -8192;
-            }
-            else if (torque < 0)
-            {
-                a = 8192;
-            }
-        }
+        // 電気角オフセット
+        theta_e = (elec_angle + electrical_offset) & 0x7FFF;
 
-        elec_angle = (elec_angle + a); // 8192 = 90deg
-
-        // 位相計算
-        if (elec_angle < 0)
+        // 次のエンコーダーリクエスト送信
+        if (!encoder_rx_busy && !encoder_packet_ready)
         {
-            elec_angle = 32768 + elec_angle;
+            encoder_request();
         }
-        elec_angle = elec_angle & ((1 << 15) - 1);
-        phase = phase_offset + (float)(elec_angle) / (float)(1 << 15) * (float)PHASE_MAX;
     }
 }
 
 void torque_mode_process()
 {
     mcp3204_dma_init();
-    /* タイマーからADC取得を開始 */
-    mcp3204_timer_start();
+    mcp3204_start_read_dma();
 
     sleep_ms(100);
     offset_calibrating = true;
@@ -1279,22 +1200,22 @@ int main()
     {
         tud_task(); // HID + CDC USB task processing
         if (absolute_time_diff_us(get_absolute_time(), next_cdc_log) <= 0) {
-            cdc_logf("Vd=%.2f Vq=%.2f spi_error=%d angle=%d rotNum=%d theta_e=%d CH0=%d CH1=%d I_d=%d I_q=%d\r\n",
-                     Vd_global, Vq_global, spi_error_count, angle_core0, rotateNum_core0, theta_e, mcp3204_latest_raw[0], mcp3204_latest_raw[1], I_d_global, I_q_global);
-            next_cdc_log = make_timeout_time_ms(200);
+            cdc_logf("Vd=%.2f Vq=%.2f spi_error=%d magnitude=%d angle=%d rotNum=%d Iq_ref=%.2f I_d=%d I_q=%d\r\n",
+                     Vd_global, Vq_global, spi_error_count, ffb_magnitude, angle_core0, rotateNum_core0, Iq_ref, I_d_global, I_q_global);
+            next_cdc_log = make_timeout_time_ms(500);
         }
 
         // 排他制御して読み込み
         uint32_t irq = save_and_disable_interrupts();
         spin_lock_unsafe_blocking(lock);
-        magnitude_share = -ffb_magnitude; // to core1
+        magnitude_share = ffb_magnitude; // to core1
         limitRot_share = limitRot_core0;
         angle_core0 = angle_share; // from core1
         rotateNum_core0 = rotateNum_share;
         spin_unlock_unsafe(lock);
         restore_interrupts(irq);
 
-        adc_select_input(1);
+        adc_select_input(2);
         adc0 = adc_read();
         if (adc0 > 3000)
         {
