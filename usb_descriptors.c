@@ -601,7 +601,10 @@ static uint8_t const desc_gamepad[] = {
 				0x45, 0x03, // PHYSICAL_MAXIMUM (03)
 				0x75, 0x08, // REPORT_SIZE (08)
 				0x95, 0x01, // REPORT_COUNT (01)
-				0xB1, 0x02, // FEATURE (Data) 0x00
+				// Block Load Status is an enumerated usage (Success/Full/Error).
+				// It must be an Array so DirectInput can read the selected usage
+				// with HidP_GetUsages().
+				0xB1, 0x00, // FEATURE (Data,Array,Absolute)
 			0xC0, // END COLLECTION ()
 			0x09, 0xAC, // USAGE (RAM Pool Available)
 			0x15, 0x00, // LOGICAL_MINIMUM (00)

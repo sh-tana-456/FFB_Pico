@@ -36,7 +36,12 @@ pico_sdk_init()
 # Add executable. Default name is the project name, version 0.1
 
 add_executable(ffb
-    ffb_hid_cdc.c
+    main.c
+    hid/ffb_hid.c
+    hid/gamepad_hid.c
+    motor/motor_control.c
+    motor/encoder_uart.c
+    motor/mcp3204.c
     usb_descriptors.c
     )
 
@@ -71,4 +76,3 @@ target_include_directories(ffb PRIVATE
 )
 
 pico_add_extra_outputs(ffb)
-
