@@ -9,7 +9,6 @@
 ・UARTでエンコーダーにコマンド送信、直後にRXに来たデータを処理。
 ・MCP3204の電流センサをSPIで読み込み、DMAで非同期取得。
 */
-#include <stdlib.h>
 #include <math.h>
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
@@ -33,10 +32,11 @@
 #define DEBUG_PIN_3 24   // デバッグ用GPIO
 
 // 三相PWM設定
-#define CARRIER_FREQ_HZ 8000.0f // 20kHz キャリア
-#define SINE_FREQ_HZ 0.0f        // 変調周波数
-#define PHASE_MAX (1U << 31)
+#define CARRIER_FREQ_HZ 20000.0f // 16kHz キャリア
 #define PHASE_RSL (1U << 11)
+#define Q15_SHIFT 15
+#define Q15_ONE (1 << Q15_SHIFT)
+#define Q15_SQRT3 56756 // sqrt(3) * 2^15
 #define CURRENT_MA_PER_COUNT (3.3f / 4095.f) / (0.044f / 1.0f) * 1000.0f
 static volatile uint16_t current_offset_u = 2048;
 static volatile uint16_t current_offset_v = 2048;
@@ -52,19 +52,14 @@ static float current_lpf_ch1 = 2048.0f;
 
 static volatile bool spi_error = false;
 static volatile uint32_t spi_error_count = 0;
+static volatile int32_t soft_limit_iq_ref;
+static volatile int32_t motor_position_counts;
 /*--------------共有変数------------*/
 volatile int32_t angle_share = 0;     // エンコーダーで読み取った角度
 volatile int32_t magnitude_share = 0; // FFB指令値
 volatile int32_t rotateNum_share = 0;  // モーターの原点からの回転回数
-volatile int8_t limitRot_share = 0;   // 回転制限 0 or 1
 spin_lock_t *lock;
 /*----------------------------------*/
-
-
-volatile int16_t ffb_magnitude = 0;
-volatile int32_t angle_core0 = 0;
-volatile int32_t rotateNum_core0 = 0;
-uint16_t adc0 = 0;
 
 int32_t I_u_global = 0;
 int32_t I_v_global = 0;
@@ -72,36 +67,24 @@ int32_t I_alpha_global = 0;
 int32_t I_beta_global = 0;
 int32_t I_d_global = 0;
 int32_t I_q_global = 0;
-float Vu_global = 0.0f, Vv_global = 0.0f, Vw_global = 0.0f;
 float Vd_global = 0.0f, Vq_global = 0.0f;
 
 /*-------------only use in CORE1-------------*/
-// 位相変数（rad単位）、3相分はオフセットで扱う
-volatile uint32_t phase = 0;
-const uint32_t phase_offset = 57445188; // 9.63deg angleオフセット2090041344
-uint32_t delta_phase;                   // 1キャリア周期ごとの位相ステップ
 // PWM wrap 値（TOP）
 uint32_t wrap_val;
 uint32_t deadtime;
 // 各スライス番号・チャネル
 uint slice_u, slice_v, slice_w;
 uint chan_u, chan_v, chan_w;
-float MR = 0.0f; // 変調率
 float torque_max = 0.2f; // 最大変調率設定
-float sinValues[2 * PHASE_RSL];
-float cosValues[2 * PHASE_RSL];
-float rdmValues[2 * PHASE_RSL];
-int rotate_mode = 1;
-uint8_t error = 0;
-volatile int32_t angle = 0, pre_angle = 0; // 17bit treated as 360deg
-volatile uint8_t direction_cmd = 0;        // 0:stop, 1:+, 2:-
+int16_t sinValues[2 * PHASE_RSL];
+int16_t cosValues[2 * PHASE_RSL];
+volatile int32_t angle = 0; // 17bit treated as 360deg
 volatile int32_t rotateNum_core1 = 0;
-volatile int8_t limitRot_core1 = 0;
 volatile int32_t elec_angle = 0;
-volatile int32_t elec_angle_raw = 0;
 volatile int32_t electrical_offset = 32768 - 8829; // theta_e=0固定のときの電気角を差し引く
 volatile int32_t theta_e = 0;
-// Set by the 8 kHz PWM wrap ISR and consumed by the core1 foreground loop.
+// Set by the PWM wrap ISR and consumed by the core1 foreground loop.
 // UART/RS-485 handling must never execute in the FOC ISR.
 static volatile bool encoder_request_due;
 static bool encoder_request_phase;
@@ -110,6 +93,8 @@ float Id_ref = 0.0f;
 float Iq_ref = 0.0f;
 float error_d = 0.0f;
 float error_q = 0.0f;
+// Written by core1 foreground code. The PWM ISR uses this Q15 value only.
+static volatile int32_t modulation_q15;
 
 typedef struct {
     float kp;
@@ -156,6 +141,82 @@ int apply_limit(int value, int max)
         value = max;
     }
     return value;
+}
+
+static inline int32_t q15_multiply(int32_t a, int32_t b)
+{
+    return (int32_t)(((int64_t)a * b) >> Q15_SHIFT);
+}
+
+static inline int32_t q15_from_unit_float(float value)
+{
+    if (value >= 1.0f) return Q15_ONE - 1;
+    if (value <= -1.0f) return -Q15_ONE;
+    return (int32_t)(value * (float)Q15_ONE);
+}
+
+static inline uint32_t pwm_duty_from_q15(int32_t phase_voltage_q15,
+                                          int32_t modulation_q15_value)
+{
+    int32_t centered_voltage = phase_voltage_q15 + Q15_ONE;
+    if (centered_voltage < 0) centered_voltage = 0;
+    if (centered_voltage > 2 * Q15_ONE - 1) centered_voltage = 2 * Q15_ONE - 1;
+    if (modulation_q15_value < 0) modulation_q15_value = 0;
+    if (modulation_q15_value > Q15_ONE) modulation_q15_value = Q15_ONE;
+
+    // Modulation * ((phase_voltage + 1) / 2) * wrap, using only integers.
+    uint32_t scaled_voltage = ((uint32_t)modulation_q15_value *
+                               (uint32_t)centered_voltage) >> Q15_SHIFT;
+    return (scaled_voltage * wrap_val) >> 16;
+}
+
+static inline int32_t clamp_i32(int32_t value, int32_t lower, int32_t upper)
+{
+    if (value < lower) return lower;
+    if (value > upper) return upper;
+    return value;
+}
+
+static inline int32_t motor_continuous_position(int32_t encoder_angle,
+                                                 int32_t rotation_count)
+{
+    return encoder_angle - MOTOR_ENCODER_COUNTS_PER_REV * rotation_count;
+}
+
+static int32_t motor_soft_endstop_iq(int32_t position_counts)
+{
+    const int32_t ramp_start = MOTOR_SOFT_LIMIT_HALF_COUNTS - MOTOR_SOFT_LIMIT_RAMP_COUNTS;
+    if (position_counts >= ramp_start) {
+        int32_t penetration = position_counts - ramp_start;
+        int32_t force = (int32_t)(((int64_t)penetration * MOTOR_SOFT_LIMIT_MAX_IQ_MA) /
+                                  MOTOR_SOFT_LIMIT_RAMP_COUNTS);
+        return -clamp_i32(force, 0, MOTOR_SOFT_LIMIT_MAX_IQ_MA);
+    }
+    if (position_counts <= -ramp_start) {
+        int32_t penetration = -ramp_start - position_counts;
+        int32_t force = (int32_t)(((int64_t)penetration * MOTOR_SOFT_LIMIT_MAX_IQ_MA) /
+                                  MOTOR_SOFT_LIMIT_RAMP_COUNTS);
+        return clamp_i32(force, 0, MOTOR_SOFT_LIMIT_MAX_IQ_MA);
+    }
+    return 0;
+}
+
+static int32_t motor_apply_soft_endstop(int32_t ffb_iq, int32_t position_counts)
+{
+    int32_t endstop_iq = motor_soft_endstop_iq(position_counts);
+
+    // At or beyond the configured range, never allow FFB to push farther out.
+    if (position_counts >= MOTOR_SOFT_LIMIT_HALF_COUNTS && ffb_iq > 0) {
+        ffb_iq = 0;
+    } else if (position_counts <= -MOTOR_SOFT_LIMIT_HALF_COUNTS && ffb_iq < 0) {
+        ffb_iq = 0;
+    }
+
+    soft_limit_iq_ref = endstop_iq;
+    if (endstop_iq == 0) return ffb_iq;
+    return clamp_i32(ffb_iq + endstop_iq,
+                     -MOTOR_SOFT_LIMIT_MAX_IQ_MA,
+                     MOTOR_SOFT_LIMIT_MAX_IQ_MA);
 }
 static void motor_process_current_sample(uint16_t raw_u, uint16_t raw_v)
 {
@@ -218,7 +279,7 @@ void pwm_wrap_irq_handler()
     // 次割り込み用のADC読み込み開始
     (void)mcp3204_start_read();
 
-    // Schedule the position request every second PWM period (4 kHz).  The
+    // Schedule the position request every second PWM period. The
     // foreground loop performs the UART/DMA operation after this ISR returns.
     encoder_request_phase = !encoder_request_phase;
     if (encoder_request_phase) {
@@ -230,8 +291,17 @@ void pwm_wrap_irq_handler()
     int32_t iu_ma = -iw_ma - iv_ma;
     int32_t I_alpha = iu_ma;
     int32_t I_beta = ((iu_ma + 2 * iv_ma) * 37837) >> 16; // 1/sqrt(3) -> 0.577350269×65536≈37837
-    int32_t I_d = I_alpha * cosValues[theta_e >> 4] + I_beta * sinValues[theta_e >> 4];
-    int32_t I_q = -I_alpha * sinValues[theta_e >> 4] + I_beta * cosValues[theta_e >> 4];
+    uint32_t trig_index = (uint32_t)theta_e >> 4;
+    int32_t sin_theta_q15 = sinValues[trig_index];
+    int32_t cos_theta_q15 = cosValues[trig_index];
+
+    // Previous float dq transform (kept for numerical comparison):
+    // int32_t I_d = I_alpha * cosValues[trig_index] + I_beta * sinValues[trig_index];
+    // int32_t I_q = -I_alpha * sinValues[trig_index] + I_beta * cosValues[trig_index];
+    int32_t I_d = q15_multiply(I_alpha, cos_theta_q15) +
+                  q15_multiply(I_beta, sin_theta_q15);
+    int32_t I_q = -q15_multiply(I_alpha, sin_theta_q15) +
+                  q15_multiply(I_beta, cos_theta_q15);
 
     error_d = Id_ref - (float)I_d;
     error_q = Iq_ref - (float)I_q;
@@ -239,13 +309,22 @@ void pwm_wrap_irq_handler()
     float Vd = pi_update(&pi_d, error_d, 1.0f / CARRIER_FREQ_HZ);
     float Vq = pi_update(&pi_q, error_q, 1.0f / CARRIER_FREQ_HZ);
 
-    // 逆変換
-    float V_alpha = Vd * cosValues[theta_e >> 4] - Vq * sinValues[theta_e >> 4];
-    float V_beta  = Vd * sinValues[theta_e >> 4] + Vq * cosValues[theta_e >> 4];
+    int32_t Vd_q15 = q15_from_unit_float(Vd);
+    int32_t Vq_q15 = q15_from_unit_float(Vq);
 
-    float Vu = V_alpha;
-    float Vv = -0.5f * V_alpha + 0.8660254f * V_beta;
-    float Vw = -0.5f * V_alpha - 0.8660254f * V_beta;
+    // Previous float inverse-dq and three-phase transform:
+    // float V_alpha = Vd * cosValues[trig_index] - Vq * sinValues[trig_index];
+    // float V_beta  = Vd * sinValues[trig_index] + Vq * cosValues[trig_index];
+    // float Vu = V_alpha;
+    // float Vv = -0.5f * V_alpha + 0.8660254f * V_beta;
+    // float Vw = -0.5f * V_alpha - 0.8660254f * V_beta;
+    int32_t V_alpha_q15 = q15_multiply(Vd_q15, cos_theta_q15) -
+                          q15_multiply(Vq_q15, sin_theta_q15);
+    int32_t V_beta_q15 = q15_multiply(Vd_q15, sin_theta_q15) +
+                         q15_multiply(Vq_q15, cos_theta_q15);
+    int32_t Vu_q15 = V_alpha_q15;
+    int32_t Vv_q15 = (-V_alpha_q15 + q15_multiply(Q15_SQRT3, V_beta_q15)) >> 1;
+    int32_t Vw_q15 = (-V_alpha_q15 - q15_multiply(Q15_SQRT3, V_beta_q15)) >> 1;
 
     I_u_global = iu_ma;
     I_v_global = iv_ma;
@@ -255,20 +334,10 @@ void pwm_wrap_irq_handler()
     I_q_global = I_q;
     Vd_global = Vd;
     Vq_global = Vq;
-    Vu_global = Vu;
-    Vv_global = Vv;
-    Vw_global = Vw;
-
-    // 3相の振幅計算（浮動小数点 sinf)
-    float su = 0.0f, sv = 0.0f, sw = 0.0f;
-    su = Vu;
-    sv = Vv;
-    sw = Vw;
-
-    // デューティ（0 ～ wrap_val）の計算: (sin*0.5 + 0.5) を乗算
-    uint32_t du = (uint32_t)(MR * (su * 0.5f + 0.5f) * (float)wrap_val); // + rdmValues[phase >> 20]
-    uint32_t dv = (uint32_t)(MR * (sv * 0.5f + 0.5f) * (float)wrap_val); // + rdmValues[(phase >> 20) + 683]
-    uint32_t dw = (uint32_t)(MR * (sw * 0.5f + 0.5f) * (float)wrap_val); // + rdmValues[(phase >> 20) + 1365]
+    // PWM ISRでの浮動小数点三相計算は行わない。
+    uint32_t du = pwm_duty_from_q15(Vu_q15, modulation_q15);
+    uint32_t dv = pwm_duty_from_q15(Vv_q15, modulation_q15);
+    uint32_t dw = pwm_duty_from_q15(Vw_q15, modulation_q15);
 
     // 比較レジスタ更新：次周期から反映
     pwm_set_chan_level(slice_u, chan_u, apply_limit(du - deadtime / 2, wrap_val));
@@ -383,27 +452,23 @@ void ffb_process()
     gpio_put(PIN_W_SD, 0);
 
     // モーター制御用数値設定
-    phase = phase_offset;
     angle = encoder_uart_initial_position();
-    int pre_elec = 0;
-    float torque = 0.0f;
-    int32_t local_magnitude = 0, pre_local_magnitude = 0; // max 10000
-    float Kd = 0.0f, alpha = 0.001f, beta = 0.25f;
-    int delta_angle = 0, pre_delta_angle = 0, a = 0;
+    int32_t previous_angle = angle;
+    int32_t local_magnitude = 0; // max 10000
+    int delta_angle = 0;
 
     pwm_init_set();
 
     while (true)
     {
-        pre_angle = angle;
-        pre_delta_angle = delta_angle;
+        previous_angle = angle;
 
         int32_t encoder_angle;
         if (encoder_uart_read_position(&encoder_angle)) {
             angle = encoder_angle;
         }
         
-        delta_angle = angle - pre_angle;
+        delta_angle = angle - previous_angle;
         if (delta_angle > 65535)
         {
             rotateNum_core1++;
@@ -418,7 +483,6 @@ void ffb_process()
         uint32_t irq = save_and_disable_interrupts();
         spin_lock_unsafe_blocking(lock);
         local_magnitude = magnitude_share; // from core0
-        limitRot_core1 = limitRot_share;   // from core0
         angle_share = angle;               // to core0
         rotateNum_share = rotateNum_core1; // to core0
         spin_unlock_unsafe(lock);
@@ -441,14 +505,10 @@ void ffb_process()
         {
             elec_angle = 65536 + angle;
         }
-        else
-        {
-            error = 1;
-        }
-        elec_angle_raw = elec_angle;
-
-        MR = torque_max;
-        Iq_ref = (float)local_magnitude / 2.0f;
+        motor_position_counts = motor_continuous_position(angle, rotateNum_core1);
+        int32_t ffb_iq = local_magnitude / 2;
+        Iq_ref = (float)motor_apply_soft_endstop(ffb_iq, motor_position_counts);
+        modulation_q15 = q15_from_unit_float(torque_max);
         Id_ref = 0.0f;
 
         // 電気角オフセット
@@ -484,27 +544,24 @@ void torque_mode_process()
     gpio_put(PIN_W_SD, 0);
 
     // モーター制御用数値設定
-    phase = phase_offset;
     angle = encoder_uart_initial_position();
-    int pre_elec = 0;
     float torque = 0.0f;
-    int32_t local_magnitude = 10000, pre_local_magnitude = 0; // max 10000
-    float Kd = 0.0f, alpha = 0.001f, beta = 0.25f;
-    int delta_angle = 0, pre_delta_angle = 0, a = 0;
+    int32_t previous_angle = angle;
+    int32_t local_magnitude = 10000;
+    int delta_angle = 0;
 
     pwm_init_set();
 
     while (true)
     {
-        pre_angle = angle;
-        pre_delta_angle = delta_angle;
+        previous_angle = angle;
 
         int32_t encoder_angle;
         if (encoder_uart_read_position(&encoder_angle)) {
             angle = encoder_angle;
         }
         
-        delta_angle = angle - pre_angle;
+        delta_angle = angle - previous_angle;
         if (delta_angle > 65535)
         {
             rotateNum_core1++;
@@ -540,15 +597,8 @@ void torque_mode_process()
         {
             elec_angle = 65536 + angle;
         }
-        else
-        {
-            error = 1;
-        }
-        elec_angle_raw = elec_angle;
-
         torque = torque_max * (float)local_magnitude / 10000.f;
-        // if(rotateNum_core1!=0){MR = 0.07f;}else{MR = fabs(torque);} // (0.10f * fabs(angle) / 65536.f) +
-        MR = fabs(torque);
+        modulation_q15 = q15_from_unit_float(fabs(torque));
 
         // 電気角オフセット
         theta_e = (elec_angle + electrical_offset) & 0x7FFF;
@@ -587,9 +637,8 @@ void motor_control_init(void)
 {
     for (int x = 0; x < 2 * PHASE_RSL; ++x) {
         float s = 2.0f * (float)M_PI * (float)x / (float)PHASE_RSL;
-        sinValues[x] = sinf(s);
-        cosValues[x] = cosf(s);
-        rdmValues[x] = (float)(rand() % 100 - 50) / 1000.0f;
+        sinValues[x] = (int16_t)(sinf(s) * (float)(Q15_ONE - 1));
+        cosValues[x] = (int16_t)(cosf(s) * (float)(Q15_ONE - 1));
     }
     encoder_uart_init();
     lock = spin_lock_instance(0);
@@ -608,12 +657,16 @@ void motor_read_position(int32_t *out_angle, int32_t *out_rotation_count)
     restore_interrupts(irq);
 }
 
-void motor_set_ffb_command(int16_t magnitude, int8_t rotation_limit)
+void motor_set_ffb_command(int16_t magnitude)
 {
+#if WHEEL_DIRECTION_REVERSED
+    // The HID axis is reversed in main.c. Reverse the resulting force at the
+    // motor boundary as well so position-dependent effects remain restorative.
+    magnitude = -magnitude;
+#endif
     uint32_t irq = save_and_disable_interrupts();
     spin_lock_unsafe_blocking(lock);
     magnitude_share = magnitude;
-    limitRot_share = rotation_limit;
     spin_unlock_unsafe(lock);
     restore_interrupts(irq);
 }
@@ -631,6 +684,8 @@ motor_status_t motor_get_status(void)
     return (motor_status_t){
         .vd = Vd_global, .vq = Vq_global, .iq_ref = Iq_ref,
         .i_d = I_d_global, .i_q = I_q_global,
+        .soft_limit_iq = soft_limit_iq_ref,
+        .motor_position_counts = motor_position_counts,
         .spi_error_count = spi_error_count,
         .encoder_request_count = encoder_stats.request_count,
         .encoder_response_count = encoder_stats.response_count,

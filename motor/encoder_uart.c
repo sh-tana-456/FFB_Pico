@@ -18,8 +18,8 @@
 #define ENCODER_RESPONSE_TIMEOUT_US 1000
 // The wire transfer itself takes about 48 us at 2.5 Mbps.  Keep a quiet
 // interval between queries so PWM switching noise cannot turn continuous
-// polling into dropped frames. PWM slots schedule 4 kHz updates; this is a
-// secondary guard and does not add work to the 8 kHz PWM ISR.
+// polling into dropped frames. PWM slots schedule the desired update rate;
+// this is a secondary guard and does not add work to the PWM ISR.
 #define ENCODER_REQUEST_INTERVAL_US 200
 
 static int rx_dma_channel = -1;

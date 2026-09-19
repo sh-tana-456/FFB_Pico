@@ -9,6 +9,8 @@ Raspberry Pi Pico を USB 複合デバイス（ゲームパッド HID、PID Forc
 | [README.md](README.md) | ビルド、利用方法、ソース構成、開発時の変更箇所（この文書） |
 | [DEVICE_SUPPORT.md](DEVICE_SUPPORT.md) | OS・テストツール・ゲームごとの動作確認状況と未検証項目 |
 | [HID_CDC_INTEGRATION.md](HID_CDC_INTEGRATION.md) | TinyUSB 複合デバイスの構成と、HID/CDC を変更するときの注意 |
+| [HID_FFB_IMPLEMENTATION.md](HID_FFB_IMPLEMENTATION.md) | PID FFBの各レポート、エフェクト合成、モーター制御への受け渡し |
+| [GAMEPAD_INPUTS.md](GAMEPAD_INPUTS.md) | ゲームパッドの軸・ボタン入力のピン割当と追加方法 |
 | [debug_log/README_MCP3204_FOC_debug.md](debug_log/README_MCP3204_FOC_debug.md) | MCP3204/FOC の過去の調査ログ |
 
 ## 構成
@@ -52,7 +54,7 @@ cmake --build build -j2
 
 USB 接続後、ホストには次の機能が現れます。
 
-- ゲームパッド HID: X 軸はホイール位置、Y 軸はペダル値です。
+- ゲームパッド HID: X軸はホイール、Y軸はアクセル、Z軸はブレーキ、Buttons 1–4はGPIO入力です。
 - PID Force Feedback HID: PC が送信したエフェクトを `ffb_hid` が合成し、モーター指令値に変換します。
 - CDC ACM: FFB 状態、角度、電流制御状態の診断ログを出力します。
 
@@ -80,6 +82,10 @@ cat /dev/ttyACM0
 - MCP3204 の SPI ピン、速度、DMA 転送を変える: `motor/mcp3204.c`
 - 電流 LPF、オフセット校正、FOC/PWM を変える: `motor/motor_control.c`
 - ペダルの ADC 範囲、LED、CDC のログ内容を変える: `main.c`
+
+## 回転方向の反転
+
+ギア追加などでホイールの論理的な正方向がエンコーダー・モーターの正方向と逆になった場合は、`motor/motor_control.h`の`WHEEL_DIRECTION_REVERSED`を`0`から`1`へ変更します。この設定はHIDへ送るX軸と、モーターへ渡すFFB `magnitude`を同時に反転します。どちらかだけを反転すると、Springなどの復元力が外向きになります。
 
 ## 注意
 

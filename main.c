@@ -17,12 +17,15 @@
 #define LED_FFB_ACTIVE 4
 #define LED_FFB_MAGNITUDE 25
 #define CDC_LOG_INTERVAL_MS 137
-#define WHEEL_ANGLE_DEGREES 540.0f
-#define WHEEL_REDUCTION_RATIO 4.0f
+#define ACCELERATOR_ADC_INPUT 2 // GPIO28 / ADC2
+#define BRAKE_ADC_INPUT 1       // GPIO27 / ADC1
+#define BUTTON_1_PIN 2
+#define BUTTON_2_PIN 3
+#define BUTTON_3_PIN 5
+#define BUTTON_4_PIN 7
 
 typedef struct {
     int16_t x;
-    int8_t rotation_limit;
 } wheel_input_t;
 
 static wheel_input_t wheel_input_from_encoder(int32_t angle_17bit, int32_t rotation_count)
@@ -37,10 +40,39 @@ static wheel_input_t wheel_input_from_encoder(int32_t angle_17bit, int32_t rotat
 
     int32_t x = (int32_t)(-32767.0f *
         (360.0f * (combined_angle / 131072.0f) /
-         (WHEEL_ANGLE_DEGREES * WHEEL_REDUCTION_RATIO / 2.0f)));
-    if (x > 32767) return (wheel_input_t){.x = 32767, .rotation_limit = 1};
-    if (x < -32767) return (wheel_input_t){.x = -32767, .rotation_limit = -1};
-    return (wheel_input_t){.x = (int16_t)x, .rotation_limit = 0};
+         (MOTOR_WHEEL_RANGE_DEGREES * MOTOR_WHEEL_REDUCTION_RATIO / 2.0f)));
+#if WHEEL_DIRECTION_REVERSED
+    x = -x;
+#endif
+    if (x > 32767) return (wheel_input_t){.x = 32767};
+    if (x < -32767) return (wheel_input_t){.x = -32767};
+    return (wheel_input_t){.x = (int16_t)x};
+}
+
+static uint16_t pedal_axis_from_adc(uint16_t adc_value)
+{
+    return adc_value > 3000 ? 32767 : adc_value < 1200 ? 0 :
+        (uint16_t)((float)(adc_value - 1200) * 32767.0f / 1800.0f);
+}
+
+static void gamepad_buttons_init(void)
+{
+    const uint button_pins[] = {BUTTON_1_PIN, BUTTON_2_PIN, BUTTON_3_PIN, BUTTON_4_PIN};
+    for (uint i = 0; i < count_of(button_pins); ++i) {
+        gpio_init(button_pins[i]);
+        gpio_set_dir(button_pins[i], GPIO_IN);
+        gpio_pull_up(button_pins[i]);
+    }
+}
+
+static uint8_t gamepad_buttons_read(void)
+{
+    const uint button_pins[] = {BUTTON_1_PIN, BUTTON_2_PIN, BUTTON_3_PIN, BUTTON_4_PIN};
+    uint8_t buttons = 0;
+    for (uint i = 0; i < count_of(button_pins); ++i) {
+        if (!gpio_get(button_pins[i])) buttons |= 1u << i;
+    }
+    return buttons;
 }
 
 static void cdc_logf(const char *fmt, ...)
@@ -73,6 +105,7 @@ int main(void)
     adc_gpio_init(26);
     adc_gpio_init(27);
     adc_gpio_init(28);
+    gamepad_buttons_init();
 
     board_init();
     tusb_init();
@@ -96,13 +129,15 @@ int main(void)
         // ハンドル位置、ゲーム司令からmagnitudeを生成
         int16_t magnitude = ffb_hid_update(wheel.x);
         bool active = ffb_hid_active();
-        motor_set_ffb_command(magnitude, wheel.rotation_limit);
+        motor_set_ffb_command(magnitude);
 
-        adc_select_input(2);
-        uint16_t adc_value = adc_read();
-        uint16_t pedal = adc_value > 3000 ? 32767 : adc_value < 1200 ? 0 :
-            (uint16_t)((float)(adc_value - 1200) * 32767.0f / 1800.0f);
-        if (!ffb_state_sent) gamepad_hid_send(wheel.x, pedal);
+        adc_select_input(ACCELERATOR_ADC_INPUT);
+        uint16_t accelerator = pedal_axis_from_adc(adc_read());
+        adc_select_input(BRAKE_ADC_INPUT);
+        uint16_t brake = pedal_axis_from_adc(adc_read());
+        if (!ffb_state_sent) {
+            gamepad_hid_send(wheel.x, accelerator, brake, gamepad_buttons_read());
+        }
         motor_set_gate_enabled(active);
 
         gpio_put(LED_FFB_ACTIVE, active);
@@ -111,12 +146,13 @@ int main(void)
         if (absolute_time_diff_us(get_absolute_time(), next_log) <= 0) {
             uint8_t effect = ffb_hid_active_effect();
             motor_status_t status = motor_get_status();
-            cdc_logf("spi_error=%lu encoder_req=%lu rsp=%lu timeout=%lu rsp_us=%lu max_rsp_us=%lu magnitude=%d active=%d effect=%u type=%02X base=%d period=%lu angle=%ld rotNum=%ld I_d=%ld I_q=%ld hid_rx=%lu last=%02X/%u/%u\r\n",
+            cdc_logf("spi_error=%lu encoder_req=%lu rsp=%lu timeout=%lu rsp_us=%lu max_rsp_us=%lu magnitude=%d active=%d effect=%u type=%02X base=%d period=%lu angle=%ld rotNum=%ld pos=%ld endstop=%ld I_d=%ld I_q=%ld hid_rx=%lu last=%02X/%u/%u\r\n",
                      status.spi_error_count, status.encoder_request_count,
                      status.encoder_response_count, status.encoder_timeout_count,
                      status.encoder_last_response_us, status.encoder_max_response_us, magnitude, active,
                      effect, ffb_hid_effect_type(effect), ffb_hid_effect_magnitude(effect),
                      ffb_hid_effect_period(effect), raw_angle, rotation_count,
+                     status.motor_position_counts, status.soft_limit_iq,
                      status.i_d, status.i_q, ffb_hid_received_report_count(),
                      ffb_hid_last_report_id(), ffb_hid_last_report_type(),
                      ffb_hid_last_report_length());
